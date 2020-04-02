@@ -38,7 +38,7 @@ Linear probing hash tables (LPHTs) have good performance at 0.5 load factor.
 
 Suppose we have a LPHT "T1" with a high load factor, but after a small number of collisions we move to a second LPHT "T2" which has a low load factor. Insertions would then have the good performance of T2 with some constant overhead from checking T1 first.
 
-For good read performance, we want a good chance of finding results in the first table checked. Let's say T2 is 1/4 the size of T1.
+For good read performance, we want a good chance of finding results in the first table checked. Let's say T2 is 1/4 the size of T1, and we check 4 slots in T1 before going to T2.
 
 That gives a better load factor, but every read from T2 will obviously require at least 5 probes, and a lot of the data is in T2. So, the average number of probes is relatively high.
 
