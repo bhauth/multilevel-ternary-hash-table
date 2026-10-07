@@ -1,5 +1,4 @@
 // Multilevel Ternary Hash Table (MTHT)
-// Implementation of docs/build-guide.md.
 //
 // Layout: T1 is an open-addressing table whose keys live in a ternary
 // neighborhood {h-1, h, h+1} of their home bucket. Displaced keys are tagged
@@ -421,9 +420,9 @@ public:
     std::size_t size() const { return count_; }
     std::size_t n1() const { return n1_; }
     std::size_t n2() const { return n2_; }
-    std::size_t t1_count() const { return t1_count_; }
+    std::size_t t1_count() const { return count_ - t2_count_; }
     std::size_t t2_count() const { return t2_count_; }
-    double load1() const { return static_cast<double>(t1_count_) / static_cast<double>(n1_); }
+    double load1() const { return static_cast<double>(t1_count()) / static_cast<double>(n1_); }
     double load2() const { return static_cast<double>(t2_count_) / static_cast<double>(n2_); }
 
     std::size_t key_store_bytes() const { return key_store_.bytes_used(); }
@@ -438,7 +437,7 @@ public:
     void clear() {
         std::memset(t1_, 0, n1_ * sizeof(Entry));
         std::memset(t2_, 0, n2_ * sizeof(Entry));
-        count_ = t1_count_ = t2_count_ = 0;
+        count_ = t2_count_ = 0;
         key_store_.clear();
     }
 
@@ -549,7 +548,6 @@ public:
         if (state == ST_EMPTY) {
             write_slot(home, fp, val, ST_OFF_ZERO);
             ++count_;
-            ++t1_count_;
             return true;
         }
 
@@ -565,13 +563,11 @@ public:
         if (get_state(t1_[first_idx]) == ST_EMPTY) {
             write_slot(t1_[first_idx], fp, val, first_state);
             ++count_;
-            ++t1_count_;
             return true;
         }
         if (get_state(t1_[second_idx]) == ST_EMPTY) {
             write_slot(t1_[second_idx], fp, val, second_state);
             ++count_;
-            ++t1_count_;
             return true;
         }
 
@@ -587,7 +583,6 @@ public:
             shift_entry(t1_[left_idx], t1_[far_left], ST_OFF_NEG);
             write_slot(t1_[left_idx], fp, val, ST_OFF_NEG);
             ++count_;
-            ++t1_count_;
             return true;
         }
 
@@ -609,7 +604,6 @@ public:
                 }
                 write_slot(t1_[(h + 1) & mask1_], fp, val, ST_OFF_POS);
                 ++count_;
-                ++t1_count_;
                 return true;
             }
             if (!can_shift_right_into(t1_[idx], idx + 1)) {
@@ -718,7 +712,6 @@ public:
 
         if (in_t1) {
             e->word &= ~(STATE_MASK << STATE_SHIFT); // state -> EMPTY, D_max kept
-            --t1_count_;
             // Read optimization, not a correctness fix: after a slot frees, a
             // key displaced into it belongs at least one step closer, so pull it
             // home. This keeps displaced entries rare under churn and leaves the
@@ -879,7 +872,7 @@ private:
         n2_ = new_n1 >> SHIFT_RATIO;
         mask1_ = n1_ - 1;
         mask2_ = n2_ - 1;
-        count_ = t1_count_ = t2_count_ = 0;
+        count_ = t2_count_ = 0;
 
         // T1 entries first, then T2: order does not affect correctness (keys are
         // independent), but T1-first keeps the ternary neighbourhoods as sparse
@@ -916,7 +909,6 @@ private:
     std::size_t mask1_ = 0;
     std::size_t mask2_ = 0;
     std::size_t count_ = 0;
-    std::size_t t1_count_ = 0;
     std::size_t t2_count_ = 0;
     Hash hash_{};
     KeyStore key_store_;
