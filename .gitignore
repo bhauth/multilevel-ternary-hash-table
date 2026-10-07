@@ -1,0 +1,6 @@
+.gitattributes
+*.exe
+
+temp/
+peers/
+bench/*.log
