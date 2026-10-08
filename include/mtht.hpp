@@ -149,23 +149,6 @@ inline const unsigned char* key_ptr_at(const void* val) {
     return static_cast<const unsigned char*>(val) - 1 - key_len_at(val);
 }
 
-// Are the key bytes stored with `val` equal to the probe key?
-inline bool key_at_equals(const void* val, const void* key, std::size_t len) {
-    const auto* base = static_cast<const unsigned char*>(val);
-    // 8-byte key (every integer key): the stored key ends immediately before the
-    // value, so it is one 8-byte load at val-9, and an equal compare already
-    // proves the stored key is 8 bytes -- no length byte needed.
-    if (len == 8) {
-        uint64_t a, b;
-        std::memcpy(&a, base - 9, 8);
-        std::memcpy(&b, key, 8);
-        return a == b;
-    }
-    // Other lengths: the length byte sits at val-1, the key bytes before it.
-    if (base[-1] != encode_key_len(len)) return false;
-    return std::memcmp(base - 1 - len, key, len) == 0;
-}
-
 // 8-bit fingerprint of a key: the filter that stands in for the key in a slot.
 //
 // The slot index is fast_map(hash, n1) -- the high bits of the 128-bit product,
@@ -227,7 +210,15 @@ inline void shift_entry(Entry& src, Entry& dst, uint8_t new_state) {
 inline bool slot_holds_fp(const Entry& e, const void* key, std::size_t len, uint8_t fp) {
     if (get_state(e) == ST_EMPTY) return false;
     if (get_fingerprint(e) != fp) return false;
-    return key_at_equals(decode_pointer(e.word), key, len);
+    const auto* base = static_cast<const unsigned char*>(decode_pointer(e.word));
+    if (len == 8) {
+        uint64_t a, b;
+        std::memcpy(&a, base - 9, 8);
+        std::memcpy(&b, key, 8);
+        return a == b;
+    }
+    if (base[-1] != encode_key_len(len)) return false;
+    return std::memcmp(base - 1 - len, key, len) == 0;
 }
 
 inline bool slot_holds(const Entry& e, const void* key, std::size_t len) {
