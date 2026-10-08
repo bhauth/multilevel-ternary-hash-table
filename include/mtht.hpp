@@ -23,8 +23,7 @@
 
 namespace mtht {
 
-// T1 entry, exactly 8 bytes so that 8 fit one 64-byte cache line.
-//
+// Entry for both tables, exactly 8 bytes so that 8 fit one 64-byte cache line.
 // The entry holds a fingerprint, not the key: the key lives once in the value
 // record the pointer reaches, and a fingerprint match is confirmed against it.
 struct alignas(8) Entry {
@@ -54,9 +53,6 @@ static constexpr uint8_t ST_TOMBSTONE = ST_OFF_NEG;
 static constexpr uint8_t DMAX_SENTINEL = 63;
 
 // Shift between a T1 home bucket and its T2 base bucket: T2.size = T1.size >> 3.
-// Growth recomputes n2 as n1 >> SHIFT_RATIO, so this ratio is what every table
-// converges to after its first grow; a caller's n2 is an initial allocation
-// only and does not survive a doubling.
 static constexpr int SHIFT_RATIO = 3;
 
 // T2 load at which the whole table doubles. Checked on the spill path only.
@@ -71,12 +67,14 @@ static constexpr uint64_t STATE_MASK = 0x03ULL;
 static constexpr uint64_t DMAX_SHIFT = 58;
 static constexpr uint64_t DMAX_MASK = 0x3FULL;
 
-// Fast range reduction replacing `hash % capacity`.
+// Hash to bucket, using the high bits of the 128-bit product (Lemire).
 inline uint64_t fast_map(uint64_t hash, uint64_t capacity) {
     return static_cast<uint64_t>(
         (static_cast<__uint128_t>(hash) * static_cast<__uint128_t>(capacity)) >> 64);
 }
 
+// Bitfield accessors for the words above. `state` is a value from the ST_*
+// enum (or ST_TOMBSTONE); `dmax` the bound from get_t2_max_offset.
 inline uint8_t get_state(const Entry& e) {
     return static_cast<uint8_t>((e.word >> STATE_SHIFT) & STATE_MASK);
 }
@@ -121,15 +119,11 @@ inline uint64_t hash_key(uint64_t k) {
     return k;
 }
 
-// An integer key is its own 8 bytes, so it never needs a span. String keys are
-// a byte span the caller keeps alive for the call. Both reach the table through
-// insert()/find()/erase() overloads; no key type is named in a call.
+// An integer key is its own 8 bytes, so it never needs a span.
 inline uint64_t hash_int(uint64_t k) { return hash_key(k); }
 
-// Key bytes as stored with `val` against a probe span.
-
-// The record stores the whole key, so a fingerprint match is confirmed exactly
-// and no collision can return another key's value:
+// The value record stores the whole key, so a fingerprint match is confirmed
+// exactly and no collision can return another key's value:
 //
 //     [ key_bytes : len ][ len - 1 : 1 ][ value... ]
 //
@@ -156,7 +150,7 @@ inline const unsigned char* key_ptr_at(const void* val) {
     return static_cast<const unsigned char*>(val) - 1 - key_len_at(val);
 }
 
-// Do the key bytes stored with `val` equal the probe key?
+// Are the key bytes stored with `val` equal to the probe key?
 inline bool key_at_equals(const void* val, const void* key, std::size_t len) {
     const auto* base = static_cast<const unsigned char*>(val);
     // 8-byte key (every integer key): the stored key ends immediately before the
@@ -180,21 +174,15 @@ inline bool key_at_equals(const void* val, const void* key, std::size_t len) {
 // those same high bits would make it agree exactly for keys that already share
 // a home slot, which is the one case the filter exists to reject. So it comes
 // from the low end instead, passed through its own mix.
-//
-// Takes the precomputed hash rather than the key: the lookup path already has
-// the hash for the slot index, and re-hashing per slot comparison is a second
-// full hash per probe.
 inline uint8_t fingerprint_of_hash(uint64_t h) {
     uint64_t k = h & 0xFFULL;
-    k *= 0x9E3779B97F4A7C15ULL; // odd multiplier: shuffles the low byte up
+    k *= 0x9E3779B97F4A7C15ULL; // h mixes the low byte up to byte 7
     return static_cast<uint8_t>(k >> 56);
 }
 
-// Spans up to 8 bytes are assembled into one word and run straight through
-// hash_key, so they pay the finalizer only; longer spans use the standard
-// string hash, which is word-at-a-time. Either way the result is finalised
-// through hash_key so slot index, fingerprint and the integer path all derive
-// from the same place.
+// Spans up to 8 bytes become one word and go straight through hash_key, so they
+// pay the finalizer only; longer spans go to std::hash<string_view> first and
+// are finalised after.
 inline uint64_t hash_bytes(const void* p, std::size_t len) {
     if (len == 8) {
         uint64_t w;
@@ -236,9 +224,7 @@ inline void shift_entry(Entry& src, Entry& dst, uint8_t new_state) {
     src.word &= ~(STATE_MASK << STATE_SHIFT);
 }
 
-// Does `e` hold the probe span? A fingerprint match is only a filter and is
-// confirmed against the real key stored with the value -- without that second
-// check an 8-bit collision would return another key's value.
+// Does `e` hold the probe span, at the already-computed fingerprint `fp`?
 inline bool slot_holds_fp(const Entry& e, const void* key, std::size_t len, uint8_t fp) {
     if (get_state(e) == ST_EMPTY) return false;
     if (get_fingerprint(e) != fp) return false;
@@ -258,9 +244,9 @@ inline bool t2_holds_fp(const Entry& e, const void* key, std::size_t len, uint8_
     return slot_holds_fp(e, key, len, fp);
 }
 
-// Hash policy, defaulting to the mixing hash. Unlike std::hash<uint64_t> (the
-// identity), MTHT masks a power of two out of the hash, and an identity hash
-// degenerates on keys whose low bits repeat.
+// Default hash policy: std::hash<uint64_t> is the identity, and the table
+// takes its index from a power-of-two mask, so an identity degenerates on keys
+// whose low bits repeat.
 struct Hash {
     std::size_t operator()(const void* p, std::size_t len) const {
         return static_cast<std::size_t>(hash_bytes(p, len));
@@ -275,8 +261,7 @@ class KeyStore {
 public:
     // `initial_bytes` is the size of the first arena block, in bytes: the store
     // opens with that much and doubles on each later block. Zero or a value
-    // below one block selects the 4 KB default. Not a per-value stride --
-    // insert() states each record's own byte count.
+    // below one block selects the 4 KB default.
     explicit KeyStore(std::size_t initial_bytes) {
         if (initial_bytes > kMinBlock) {
             block_bytes_ = round_up_16(initial_bytes);
@@ -370,23 +355,21 @@ private:
     unsigned char* bump_ = nullptr;
     std::size_t bump_left_ = 0;
     std::size_t bytes_used_ = 0;
-    std::size_t block_bytes_ = kMinBlock;          // doubles on each new block
+    std::size_t block_bytes_ = kMinBlock; // doubles on each later block
     std::vector<void*> blocks_;
 };
 
 // The table. n1 (T1 slot count) and n2 (T2 slot count) are powers of two.
-//
-// Hash is a template parameter rather than a stored member so the call inlines
-// with no indirect call per lookup.
+// Hash is a template parameter so a lookup calls it directly, with no indirect
+// call per probe.
 template <class Hash = mtht::Hash>
 class BasicTable {
 public:
     static constexpr std::size_t DEFAULT_N1 = 1u << 20; // 1,048,576 slots, 16 MB
     static constexpr std::size_t DEFAULT_N2 = DEFAULT_N1 >> SHIFT_RATIO;
 
-    // n2 is the INITIAL T2 allocation only: growth recomputes n2 as
-    // n1 >> SHIFT_RATIO, so a caller-specified ratio does not survive the first
-    // grow. n2 == 0 selects the default 1/8.
+    // n2 is the initial T2 size only: growth recomputes it as n1 >> SHIFT_RATIO,
+    // so n2 == 0 selects the default, which is also what every table settles on.
     //
     // store_bytes is the initial allocation size of the key store, in bytes;
     // zero selects the 4 KB default.
@@ -442,15 +425,8 @@ public:
     }
 
     // Re-inserting a key points the slot at a new record carrying the new
-    // value. Growth re-places entries, so pointers from raw_t1()/raw_t2() are
-    // invalidated; value pointers handed to callers are KeyStore addresses and
-    // do not move.
-    //
-    // Three key forms, all reaching the same path: an integer key, a string
-    // key (std::string / string literal / string_view, all through the
-    // string_view overload), or the raw byte-span tail of the four-argument
-    // call. Nothing here names a key type -- the caller writes
-    // t.insert(k, ...), t.insert(name, ...) or t.insert(bytes, len, ...).
+    // value. The three overloads take an integer key, a string (through the
+    // string_view overload), or a raw key span; all reach insert_key().
     bool insert(uint64_t key, const void* bytes, std::size_t bytes_len) {
         return insert_key(&key, sizeof key, bytes, bytes_len);
     }
@@ -462,8 +438,7 @@ public:
         return insert_key(key, key_len, bytes, bytes_len);
     }
 
-    // The shared insert body: key given as a span, whether from an integer, a
-    // string, or the raw four-argument call.
+    // The shared insert body: the key arrives as a span.
     bool insert_key(const void* key, std::size_t key_len, const void* bytes,
                     std::size_t bytes_len) {
         void* val = key_store_.store(key, key_len, bytes, bytes_len);
@@ -474,9 +449,7 @@ public:
         const uint8_t fp = fingerprint_of_hash(hh);
 
         // Existing key: keep the fingerprint, D_max and state bits; only the
-        // pointer changes. The slot is found by the same probes a read uses --
-        // home, then the two neighbours, then T2 -- so a displaced or spilled
-        // key is matched wherever it lives instead of only at home.
+        // pointer changes. slot_for_key finds it in T1 or T2 wherever it lives.
         bool in_t1 = false;
         if (Entry* e = slot_for_key(key, key_len, h, fp, in_t1)) {
             uint64_t tag = e->word & ~PTR_MASK;
@@ -512,9 +485,8 @@ public:
         return e;
     }
 
-    // T2 half of the read probe set: the matching Entry, or nullptr. Mirrors
-    // find_in_T2's two scan modes so insert() locates a spilled key exactly as
-    // a read would.
+    // T2 half of the probe set: the matching Entry, or nullptr. Mirrors
+    // find_in_T2's two scan modes.
     Entry* slot_for_key_T2(uint64_t h, const void* key, std::size_t key_len, uint8_t fp,
                            uint8_t max_offset) {
         uint64_t base_t2 = (h >> SHIFT_RATIO) & mask2_;
@@ -525,8 +497,7 @@ public:
                 if (t2_holds_fp(e, key, key_len, fp)) return &e;
             }
         } else {
-            // Saturated: forward sweep, stopping only at a truly free slot; a
-            // tombstone is passed over (live entries can lie beyond it).
+            // Saturated: forward sweep, stopping only at an ST_EMPTY slot.
             for (uint64_t off = 0; off < n2_; ++off) {
                 Entry& e = t2_[(base_t2 + off) & mask2_];
                 if (get_state(e) == ST_EMPTY) break;
@@ -536,9 +507,7 @@ public:
         return nullptr;
     }
 
-    // The placement ladder (steps 1-5). No existing-key check: insert() has
-    // already rejected a duplicate, and growth re-places keys that are known
-    // distinct.
+    // The placement ladder, steps 1-5 below.
     bool place_into(const void* key, std::size_t key_len, uint64_t hh, uint64_t h, void* val) {
         const uint8_t fp = fingerprint_of_hash(hh);
         Entry& home = t1_[h];
@@ -551,9 +520,10 @@ public:
             return true;
         }
 
-        // 2. Cache-line aware empty neighbor placement.
+        // 2. First free neighbor, biased to keep the entry in h's cache line
+        // (h+1 unless h is the last slot of its line).
         int cache_slot = static_cast<int>(h & 3);
-        int first_pref = (cache_slot == 3) ? -1 : +1; // right edge biases left
+        int first_pref = (cache_slot == 3) ? -1 : +1;
         int second_pref = -first_pref;
         uint64_t first_idx = (h + first_pref) & mask1_;
         uint64_t second_idx = (h + second_pref) & mask1_;
@@ -571,28 +541,26 @@ public:
             return true;
         }
 
-        // 3. One-step leftward shift on the right cache-line edge. The occupant
-        //    of h-1 moves to h-2, so it must be a same-home entry (offset 0):
-        //    anything already displaced would end up two slots from home.
+        // 3. On the right cache-line edge, shift h-1 to h-2 to free h-1 for the
+        //    home slot's key. The mover must be at offset 0 (it keeps its own
+        //    home) and h-2 free; the shifted tag is then ST_OFF_NEG by
+        //    construction.
         uint64_t left_idx = (h - 1) & mask1_;
         uint64_t far_left = (h - 2) & mask1_;
         if (cache_slot == 3 && get_state(t1_[left_idx]) == ST_OFF_ZERO &&
             get_state(t1_[far_left]) == ST_EMPTY) {
-            // Source is pinned to ST_OFF_ZERO by the guard above, so its home is
-            // h-1 and h-2 is home-1: the tag is ST_OFF_NEG with nothing to read.
             shift_entry(t1_[left_idx], t1_[far_left], ST_OFF_NEG);
             write_slot(t1_[left_idx], fp, val, ST_OFF_NEG);
             ++count_;
             return true;
         }
 
-        // 4. Greedy rightward ripple scan: open a hole at h+1 by shifting the
-        //    run right until an empty slot is found. Before anything moves, both
-        //    must hold, checked against each entry's own home rather than its
-        //    tag: it can move right at all, and it still lands within
-        //    {home-1, home, home+1} afterwards. A run failing either test is
-        //    left untouched and the insert falls through to T2, so the ripple is
-        //    all-or-nothing.
+        // 4. Greedy rightward ripple: open a hole at h+1 by shifting the run
+        //    right to the first empty slot. Before anything moves, every entry
+        //    in the run is checked against its own home (not its tag) -- it must
+        //    be able to move right and still land in {home-1, home, home+1}.
+        //    One entry failing the test abandons the whole ripple.
+        //
         for (uint64_t k = h + 1; k < h + 5; ++k) {
             uint64_t idx = k & mask1_;
             uint8_t k_state = get_state(t1_[idx]);
@@ -615,16 +583,13 @@ public:
         return insert_into_T2(hh, h, key, key_len, val);
     }
 
-    // Returns the stored bytes for the key, or nullptr. Three key forms, as
-    // with insert(): integer, string (through the string_view overload), or a
-    // raw span.
+    // Returns the stored bytes for the key, or nullptr. Three key forms, as in
+    // insert().
     void* find(uint64_t key) const { return find_key(&key, sizeof key); }
     void* find(std::string_view key) const { return find_key(key.data(), key.size()); }
     void* find(const void* key, std::size_t key_len) const { return find_key(key, key_len); }
 
     void* find_key(const void* key, std::size_t key_len) const {
-        // One hash for both derived quantities: the slot index (high bits of
-        // the product) and the fingerprint (mixed low bits).
         const uint64_t hh = hash_bytes(key, key_len);
         const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
         const uint8_t fp = fingerprint_of_hash(hh);
@@ -641,13 +606,9 @@ public:
         // is not in the home slot it is in exactly one neighbour -- never both,
         // never a third.
         //
-        // Probe order: +1 first. The ripple always shifts runs rightward, so a
-        // displaced key sits at h+1 more often than at h-1, trying +1 first
-        // lands probe 2 on the key more often and skips probe 3.
+        // Probe order: +1 first -- the ripple shifts runs rightward, so a
+        // displaced key sits at h+1 more often than at h-1.
         const int first = +1;
-        // Invariant: <= 2 probes in T1 -- 1 when the key is at home, 2 when it
-        // is displaced. Erase pulls displaced neighbours back home, so the
-        // displaced case stays rare as churn accumulates.
         const Entry& n1 = t1_[(h + (uint64_t)first) & mask1_];
         if (slot_holds_fp(n1, key, key_len, fp)) {
             return decode_pointer(n1.word);
@@ -668,10 +629,9 @@ public:
         uint64_t base_t2 = (h >> SHIFT_RATIO) & mask2_;
 
         if (max_offset < DMAX_SENTINEL) {
-            // The stored bound is (furthest offset + 1); scan down to 0. Holes
-            // are expected here -- erases leave empty (or tombstoned) slots
-            // below the bound -- so neither terminates the scan; the bound
-            // itself is what keeps it short.
+            // The stored bound is (furthest offset + 1); scan down to 0 and
+            // stop there. Empty and tombstoned slots are expected below the
+            // bound.
             for (int off = static_cast<int>(max_offset) - 1; off >= 0; --off) {
                 const Entry& e = t2_[(base_t2 + static_cast<uint64_t>(off)) & mask2_];
                 if (t2_holds_fp(e, key, key_len, fp)) {
@@ -679,9 +639,8 @@ public:
                 }
             }
         } else {
-            // D_max saturated: probe forward from the base. A tombstone is not
-            // a stopping point -- it marks a slot that was occupied and erased,
-            // and live entries can sit beyond it.
+            // D_max saturated: sweep forward from the base, stopping only at an
+            // ST_EMPTY slot.
             for (uint64_t off = 0; off < n2_; ++off) {
                 const Entry& e = t2_[(base_t2 + off) & mask2_];
                 if (get_state(e) == ST_EMPTY) break;
@@ -691,12 +650,10 @@ public:
         return nullptr;
     }
 
-    // Remove a key: the slot is located by the same slot_for_key() probes
-    // insert() and find() use, so erase agrees with them on whether the key is
-    // present and where it lives. A T1 slot clears to EMPTY (D_max kept -- the
-    // home bucket may still own T2 spills); a T2 slot becomes a tombstone, so a
-    // forward T2 scan does not stop short of live entries past it. Three key
-    // forms, as with insert().
+    // Remove a key. A T1 slot clears to EMPTY but keeps its D_max (the home
+    // bucket may still own T2 spills); a T2 slot becomes a tombstone, so a
+    // forward T2 scan does not stop short of the live entries past it. Three
+    // key forms, as in insert().
     bool erase(uint64_t key) { return erase_key(&key, sizeof key); }
     bool erase(std::string_view key) { return erase_key(key.data(), key.size()); }
     bool erase(const void* key, std::size_t key_len) { return erase_key(key, key_len); }
@@ -712,10 +669,6 @@ public:
 
         if (in_t1) {
             e->word &= ~(STATE_MASK << STATE_SHIFT); // state -> EMPTY, D_max kept
-            // Read optimization, not a correctness fix: after a slot frees, a
-            // key displaced into it belongs at least one step closer, so pull it
-            // home. This keeps displaced entries rare under churn and leaves the
-            // 2-probe bound in find() cheap to satisfy.
             pull_neighbors_home(static_cast<uint64_t>(e - t1_));
         } else {
             e->word &= ~(STATE_MASK << STATE_SHIFT);
@@ -727,8 +680,8 @@ public:
     }
 
 private:
-    // Smallest power of two >= n, so an index is `h & mask` and that is a
-    // modulo. n <= 1 returns 1; the constructor clamps to a floor first.
+    // Smallest power of two >= n, so slot indexing is `h & mask`. n <= 1
+    // returns 1; callers clamp to a floor first.
     static std::size_t ceil_pow2(std::size_t n) {
         std::size_t p = 1;
         while (p < n) p <<= 1;
@@ -736,8 +689,8 @@ private:
     }
 
     // Can the entry in `src` move one slot right, into `dest`, and still lie
-    // within its own ternary neighbourhood? Computed from the key's real home
-    // rather than the stored tag, so a stale tag cannot license an illegal move.
+    // within its own ternary neighbourhood? Taken from the key's real home, not
+    // the stored tag.
     bool can_shift_right_into(const Entry& src, uint64_t dest_slot) const {
         uint8_t st = get_state(src);
         if (st == ST_EMPTY) return true;
@@ -747,23 +700,17 @@ private:
         return delta == 0 || delta == 1 || delta == mask1_;
     }
 
-    // The tag an entry carries after moving one slot to the right. A rightward
-    // move closes one slot of the gap between the entry and its home: NEG (home
-    // is one to the right) becomes ZERO, ZERO becomes POS, and POS cannot move
-    // at all -- can_shift_right_into rejects it -- so no case maps past +1. The
-    // stored tag is trusted here; every write path stamps it from the key's
-    // real home.
+    // The tag an entry carries after moving one slot right, closing one slot of
+    // the gap to its home: NEG (home is one to the right) becomes ZERO, ZERO
+    // becomes POS. POS never reaches here -- can_shift_right_into rejects it.
     static uint8_t shifted_right_tag(uint8_t old_state) {
         return (old_state == ST_OFF_NEG) ? ST_OFF_ZERO : ST_OFF_POS;
     }
 
-    // After `slot` frees, pull a displaced neighbour back into it: a key at
-    // `slot ± 1` whose own home is `slot` belongs here and moves in. The freed
-    // gap can then travel one more step, bounded at two.
-    //
-    // Correctness does not depend on it; the <= 2-probe bound comes from insert
-    // confining offsets to {-1, 0, +1}. It is a read optimization: it keeps the
-    // displaced case rare under churn.
+    // After `slot` frees, pull a key at `slot ± 1` whose own home is `slot`
+    // back into it. The freed gap can then travel one more step, bounded at
+    // two. The <= 2-probe bound in find() comes from insert confining offsets
+    // to {-1, 0, +1} -- this only keeps the displaced case rare under churn.
     void pull_neighbors_home(uint64_t slot) {
         uint64_t gap = slot;
         for (int step = 0; step < 2; ++step) {
@@ -796,8 +743,8 @@ public:
     static uint8_t dmax_of(const Entry& e) { return get_t2_max_offset(e); }
 
 private:
-    // Home bucket of the key stored in the record at `val`, read back from the
-    // record itself. Used where only the record pointer is on hand.
+    // Home bucket of the key in the record at `val` -- for callers that hold
+    // only the record pointer.
     uint64_t home_slot_of(const void* val) const {
         return home_slot_of(key_ptr_at(val), key_len_at(val));
     }
@@ -807,11 +754,8 @@ private:
 
     bool insert_into_T2(uint64_t hh, uint64_t h, const void* key, std::size_t key_len,
                         void* val) {
-
-        // Double the whole table when T2 reaches three quarters of its slots,
-        // rather than waiting for it to run out. An integer compare against the
-        // maintained counter -- no scan. Checked here, on the spill path, so the
-        // home / neighbour / shift / ripple paths pay nothing.
+        // Double the table when T2 reaches three quarters full, so the spill
+        // path below always has room.
         if (t2_count_ >= (n2_ >> 2) * 3) {
             if (!grow_to(n1_ * 2)) {
                 return false;
@@ -821,10 +765,8 @@ private:
 
         uint64_t base_t2 = (h >> SHIFT_RATIO) & mask2_;
 
-        // Stop at the first slot that is not a live entry -- ST_EMPTY or a
-        // tombstone -- and write there. A tombstone is reusable: its key was
-        // erased, and no live entry lies between the base and it, or the scan
-        // would have hit that entry first.
+        // First slot that is not a live entry -- ST_EMPTY or a tombstone --
+        // takes the spill.
         for (uint64_t off = 0; off < n2_; ++off) {
             uint64_t idx = (base_t2 + off) & mask2_;
             uint8_t st = get_state(t2_[idx]);
@@ -833,8 +775,8 @@ private:
                 ++count_;
                 ++t2_count_;
 
-                // Record the bound as (offset + 1) so that a spill at offset 0
-                // is distinguishable from "nothing was ever pushed here".
+                // The bound is stored as (offset + 1), so offset 0 is
+                // distinguishable from "nothing spilled here".
                 uint8_t cur_dmax = get_t2_max_offset(t1_[h]);
                 uint8_t new_off = (off >= DMAX_SENTINEL - 1)
                                       ? DMAX_SENTINEL
@@ -843,16 +785,15 @@ private:
                 return true;
             }
         }
-        return false; // unplaceable in a T2 below its load threshold
+        return false; // n2_ slots all live
     }
 
-    // Replace both slot arrays with larger ones and re-place every live entry.
-    // insert_into_T2 is deliberately NOT used for the re-placement (it would
-    // re-enter the growth path); place_into is used instead, and it consults
-    // the new arrays because n1_/n2_/mask1_/mask2_ are already swapped.
+    // Replace both slot arrays with larger ones and re-place every live entry
+    // through place_into. T2-grown state does not need to carry over: the
+    // entries are re-placed from scratch against the new arrays.
     bool grow_to(std::size_t new_n1) {
         if (new_n1 <= n1_) return false;
-        new_n1 = ceil_pow2(new_n1); // mask1_ = new_n1 - 1 requires a power of two
+        new_n1 = ceil_pow2(new_n1); // mask = n1 - 1 requires a power of two
         const std::size_t old_n1 = n1_, old_n2 = n2_;
         Entry* old_t1 = t1_;
         Entry* old_t2 = t2_;
@@ -863,7 +804,7 @@ private:
         if (!new_t1 || !new_t2) {
             std::free(new_t1);
             std::free(new_t2);
-            return false; // leave the table exactly as it was
+            return false; // table untouched
         }
 
         t1_ = new_t1;
@@ -874,9 +815,8 @@ private:
         mask2_ = n2_ - 1;
         count_ = t2_count_ = 0;
 
-        // T1 entries first, then T2: order does not affect correctness (keys are
-        // independent), but T1-first keeps the ternary neighbourhoods as sparse
-        // as possible before the spills land.
+        // T1 entries first, then T2: re-placing T1 while the table is still
+        // empty keeps its neighbourhoods sparse, so fewer entries spill.
         for (std::size_t i = 0; i < old_n1; ++i) {
             const Entry& e = old_t1[i];
             if (get_state(e) == ST_EMPTY) continue;
