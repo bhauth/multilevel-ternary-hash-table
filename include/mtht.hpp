@@ -59,7 +59,6 @@ static constexpr int SHIFT_RATIO = 3;
 static constexpr double T2_GROW_LOAD = 0.75;
 
 static constexpr uint64_t PTR_MASK = 0x0000FFFFFFFFFFFFULL;
-static constexpr uint64_t PTR_BITS = 48; // address bits kept from a pointer
 static constexpr uint64_t FP_SHIFT = 48;
 static constexpr uint64_t FP_MASK = 0xFFULL;
 static constexpr uint64_t STATE_SHIFT = 56;
@@ -716,7 +715,6 @@ private:
         for (int step = 0; step < 2; ++step) {
             bool moved = false;
             for (int dir = -1; dir <= 1; dir += 2) {
-                if (dir == 0) continue;
                 uint64_t from = (gap + (uint64_t)dir) & mask1_;
                 const Entry& src = t1_[from];
                 if (get_state(src) == ST_EMPTY) continue;
