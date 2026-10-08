@@ -211,13 +211,15 @@ inline bool slot_holds_fp(const Entry& e, const void* key, std::size_t len, uint
     if (get_state(e) == ST_EMPTY) return false;
     if (get_fingerprint(e) != fp) return false;
     const auto* base = static_cast<const unsigned char*>(decode_pointer(e.word));
+    // A stored key shorter than the probe can hold the probe's bytes at val-9
+    // only by coincidence, so compare the stored length as well.
+    if (base[-1] != encode_key_len(len)) return false;
     if (len == 8) {
         uint64_t a, b;
         std::memcpy(&a, base - 9, 8);
         std::memcpy(&b, key, 8);
         return a == b;
     }
-    if (base[-1] != encode_key_len(len)) return false;
     return std::memcmp(base - 1 - len, key, len) == 0;
 }
 
