@@ -66,10 +66,11 @@ static constexpr uint64_t STATE_MASK = 0x03ULL;
 static constexpr uint64_t DMAX_SHIFT = 58;
 static constexpr uint64_t DMAX_MASK = 0x3FULL;
 
-// Hash to bucket, using the high bits of the 128-bit product (Lemire).
+// Hash to bucket: rotate the bottom 2 bytes up to the top -- those are the bits
+// the fingerprint and other fields consume.
 inline uint64_t fast_map(uint64_t hash, uint64_t capacity) {
-    return static_cast<uint64_t>(
-        (static_cast<__uint128_t>(hash) * static_cast<__uint128_t>(capacity)) >> 64);
+    uint64_t r = (hash << 16) | (hash >> 48);
+    return r & (capacity - 1);
 }
 
 // Bitfield accessors for the words above. `state` is a value from the ST_*
