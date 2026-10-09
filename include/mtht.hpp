@@ -13,12 +13,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
 #include <string_view>
 #include <functional>
-#include <utility>
-#include <memory>
-#include <new>
 #include <vector>
 
 namespace mtht {
@@ -118,9 +114,6 @@ inline uint64_t hash_key(uint64_t k) {
     k ^= k >> 31;
     return k;
 }
-
-// An integer key is its own 8 bytes, so it never needs a span.
-inline uint64_t hash_int(uint64_t k) { return hash_key(k); }
 
 // The 8 bytes at `p`, read as one word: an 8-byte key by value, whatever it
 // started life as (uint64_t, or 8 bytes of a string).
@@ -245,10 +238,6 @@ inline bool slot_holds_fp(const Entry& e, const void* key, std::size_t len, uint
     // only by coincidence, so compare the stored length as well.
     if (base[-1] != encode_key_len(len)) return false;
     return std::memcmp(base - 1 - len, key, len) == 0;
-}
-
-inline bool slot_holds(const Entry& e, const void* key, std::size_t len) {
-    return slot_holds_fp(e, key, len, fingerprint_bytes(key, len));
 }
 
 // T2 counterpart of slot_holds_fp. A T2 tombstone keeps the erased key's
@@ -387,7 +376,6 @@ template <class Hash = mtht::Hash>
 class BasicTable {
 public:
     static constexpr std::size_t DEFAULT_N1 = 1u << 20; // 1,048,576 slots, 16 MB
-    static constexpr std::size_t DEFAULT_N2 = DEFAULT_N1 >> SHIFT_RATIO;
 
     // n2 is the initial T2 size only: growth recomputes it as n1 >> SHIFT_RATIO,
     // so n2 == 0 selects the default, which is also what every table settles on.
@@ -505,27 +493,6 @@ public:
         uint8_t max_offset = get_t2_max_offset(home);
         if (max_offset == 0) return nullptr;
         Entry* e = slot_for_key_T2(h, key, key_len, fp, max_offset);
-        if (e) in_t1 = false;
-        return e;
-    }
-
-    // slot_for_key for an 8-byte key: same probe order, length-free predicate.
-    Entry* slot_for_key_8(const void* key, uint64_t h, uint8_t fp, bool& in_t1) {
-        Entry& home = t1_[h];
-        if (get_state(home) == ST_OFF_ZERO && slot_holds_fp_8(home, key, fp)) {
-            in_t1 = true;
-            return &home;
-        }
-
-        const int first = +1;
-        Entry& n1 = t1_[(h + static_cast<uint64_t>(first)) & mask1_];
-        if (slot_holds_fp_8(n1, key, fp)) { in_t1 = true; return &n1; }
-        Entry& n2 = t1_[(h + static_cast<uint64_t>(-first)) & mask1_];
-        if (slot_holds_fp_8(n2, key, fp)) { in_t1 = true; return &n2; }
-
-        uint8_t max_offset = get_t2_max_offset(home);
-        if (max_offset == 0) return nullptr;
-        Entry* e = slot_for_key_T2_8(h, key, fp, max_offset);
         if (e) in_t1 = false;
         return e;
     }
@@ -659,7 +626,7 @@ public:
 
         // 5. Neither neighbor can be cleared by a single shift: spill into T2.
         //    No ripple -- one shift each way, then the spill.
-        return insert_into_T2(hh, h, key, key_len, val);
+        return insert_into_T2(hh, h, val);
     }
 
     // insert_place for an 8-byte key: same body, length-free probes.
@@ -722,7 +689,7 @@ public:
             ++count_;
             return true;
         }
-        return insert_into_T2(hh, h, key, 8, val);
+        return insert_into_T2(hh, h, val);
     }
 
     // Returns the stored bytes for the key, or nullptr. Three key forms, as in
@@ -841,16 +808,11 @@ public:
     // Remove a key. A T1 slot clears to EMPTY but keeps its D_max (the home
     // bucket may still own T2 spills); a T2 slot becomes a tombstone, so a
     // forward T2 scan does not stop short of the live entries past it. Three
-    // key forms, as in insert().
-    bool erase(uint64_t key) { return erase_key_8(&key); }
-    bool erase(std::string_view key) {
-        if (key.size() == 8) return erase_key_8(key.data());
-        return erase_key(key.data(), key.size());
-    }
-    bool erase(const void* key, std::size_t key_len) {
-        if (key_len == 8) return erase_key_8(key);
-        return erase_key(key, key_len);
-    }
+    // key forms, as in insert(). Erase is not a hot path, so the 8-byte case
+    // runs the span path rather than a length-free copy.
+    bool erase(uint64_t key) { return erase_key(&key, sizeof key); }
+    bool erase(std::string_view key) { return erase_key(key.data(), key.size()); }
+    bool erase(const void* key, std::size_t key_len) { return erase_key(key, key_len); }
 
     bool erase_key(const void* key, std::size_t key_len) {
         const uint64_t hh = hash_bytes(key, key_len);
@@ -863,28 +825,6 @@ public:
 
         if (in_t1) {
             e->word &= ~(STATE_MASK << STATE_SHIFT); // state -> EMPTY, D_max kept
-            pull_neighbors_home(static_cast<uint64_t>(e - t1_));
-        } else {
-            e->word &= ~(STATE_MASK << STATE_SHIFT);
-            e->word |= static_cast<uint64_t>(ST_TOMBSTONE) << STATE_SHIFT;
-            --t2_count_;
-        }
-        --count_;
-        return true;
-    }
-
-    // erase_key for an 8-byte key.
-    bool erase_key_8(const void* key) {
-        const uint64_t hh = hash_key(read_word(key));
-        const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
-        const uint8_t fp = fingerprint_of_hash(hh);
-
-        bool in_t1 = false;
-        Entry* e = slot_for_key_8(key, h, fp, in_t1);
-        if (!e) return false;
-
-        if (in_t1) {
-            e->word &= ~(STATE_MASK << STATE_SHIFT);
             pull_neighbors_home(static_cast<uint64_t>(e - t1_));
         } else {
             e->word &= ~(STATE_MASK << STATE_SHIFT);
@@ -952,18 +892,6 @@ private:
         }
     }
 
-public:
-    // The home bucket of a key in T1: the only slot where it may live without
-    // displacement. Exposed so tests can verify the ternary-neighborhood
-    // invariant bit for bit.
-    uint64_t home_slot(uint64_t key) const { return home_slot_of(&key, sizeof key); }
-    uint64_t home_slot(std::string_view key) const { return home_slot_of(key.data(), key.size()); }
-    uint64_t home_slot(const void* key, std::size_t key_len) const {
-        return home_slot_of(key, key_len);
-    }
-    static uint8_t state_of(const Entry& e) { return get_state(e); }
-    static uint8_t dmax_of(const Entry& e) { return get_t2_max_offset(e); }
-
 private:
     // Home bucket of the key in the record at `val` -- for callers that hold
     // only the record pointer.
@@ -974,8 +902,7 @@ private:
         return fast_map(hash_bytes(key, key_len), static_cast<uint64_t>(n1_));
     }
 
-    bool insert_into_T2(uint64_t hh, uint64_t h, const void* key, std::size_t key_len,
-                        void* val) {
+    bool insert_into_T2(uint64_t hh, uint64_t h, void* val) {
         // Double the table when T2 reaches three quarters full, so the spill
         // path below always has room.
         if (t2_count_ >= (n2_ >> 2) * 3) {
@@ -1011,7 +938,7 @@ private:
     }
 
     // Replace both slot arrays with larger ones and re-place every live entry
-    // through place_into. T2-grown state does not need to carry over: the
+    // through insert_place. T2-grown state does not need to carry over: the
     // entries are re-placed from scratch against the new arrays.
     bool grow_to(std::size_t new_n1) {
         if (new_n1 <= n1_) return false;
