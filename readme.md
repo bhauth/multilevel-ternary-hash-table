@@ -107,7 +107,7 @@ Build: `clang++ -O2 -std=c++20 -march=native -Iinclude your_app.cpp`. Needs C++2
 200k keys by default, same hash function for every table. `-n <keys>` changes the count.
 ```sh
 clang++ -O2 -std=c++20 -march=native -Iinclude \
-        -Ipeers/robin-map-master/include -Ipeers/ankerl-unordered_dense \
+        -Ipeers/robin-map-master/include -Ipeers/ankerl-unordered_dense/include/ankerl \
         bench/longkeys.cpp -o temp/longkeys.exe
 ./temp/longkeys.exe --readme        # the table rows below, 200k keys
 ./temp/longkeys.exe --readme -n 16000   # same cells at 16k keys
@@ -119,25 +119,25 @@ Reads/s and inserts/s. Sizes in bytes.
 
 | keys   | value    | MTHT                | robin        | udense            | umap         |
 |--------|----------|---------------------|--------------|-------------------|--------------|
-| 4–24 B | 16–128 B | **42.8M / 13.8M**   | 34.8M / 10.4M | 39.5M / 11.1M    | 23.8M / 7.0M |
-| 8 B    | 256 B    | **109.7M** / **11.1M** | 60.6M / 5.8M | 65.9M / 6.0M     | 37.3M / 5.0M |
-| 256 B  | 8 B      | **9.9M** / **8.0M**  | 6.6M / 4.3M  | 8.0M / 4.7M       | 6.4M / 2.9M  |
-| 64 B   | 64 B     | **40.8M** / **10.8M** | 24.1M / 6.2M | 32.2M / 6.7M      | 20.2M / 4.0M |
-| 256 B  | 256 B    | **7.8M** / **5.4M**  | 5.7M / 2.7M  | 6.9M / 3.1M       | 5.7M / 2.1M  |
+| 4–24 B | 16–128 B | **43.4M / 14.8M**   | 34.0M / 9.2M | 39.6M / 10.2M    | 23.6M / 6.5M |
+| 8 B    | 256 B    | **122.2M / 12.8M**  | 61.0M / 5.8M | 66.0M / 5.8M     | 36.1M / 4.8M |
+| 256 B  | 8 B      | **9.3M / 8.5M**     | 7.1M / 4.3M  | 7.6M / 4.7M      | 6.4M / 2.9M  |
+| 64 B   | 64 B     | **37.8M / 9.9M**    | 17.7M / 5.7M | 30.6M / 6.8M     | 20.4M / 4.0M |
+| 256 B  | 256 B    | **7.5M / 5.6M**     | 5.8M / 2.5M  | 6.7M / 3.0M      | 5.6M / 2.1M  |
 
-Compared to udense, MTHT reads are 1.08–1.66x and inserts 1.24–1.85x the speed here, using 0.74–1.06x the memory.
+Compared to udense, MTHT reads are 1.10–1.85x and inserts 1.45–2.21x the speed here, using 0.77–1.06x the memory.
 
 #### comparison : 16k keys
 
 | keys   | value    | MTHT                | robin        | udense            | umap         |
 |--------|----------|---------------------|--------------|-------------------|--------------|
-| 4–24 B | 16–128 B | **49.2M / 19.7M**   | 35.5M / 13.2M | 46.6M / 15.1M    | 28.6M / 9.0M |
-| 8 B    | 256 B    | **184.3M** / **18.5M** | 63.5M / 7.9M | 87.0M / 8.0M     | 48.0M / 6.1M |
-| 256 B  | 8 B      | **19.2M** / **12.8M** | 15.7M / 5.5M | 18.2M / 6.0M     | 14.2M / 3.9M |
-| 64 B   | 64 B     | **47.8M** / **22.9M** | 33.1M / 9.9M | 44.1M / 10.4M    | 31.8M / 5.7M |
-| 256 B  | 256 B    | **18.2M** / **8.7M**  | 15.5M / 4.0M | 17.8M / 4.0M     | 14.1M / 2.9M |
+| 4–24 B | 16–128 B | **50.0M / 18.2M**   | 35.6M / 13.0M | 44.7M / 14.2M    | 28.0M / 8.3M |
+| 8 B    | 256 B    | **194.4M / 20.9M**  | 62.5M / 7.3M | 86.8M / 7.8M     | 48.8M / 5.9M |
+| 256 B  | 8 B      | **19.3M / 14.1M**   | 15.7M / 5.5M | 18.0M / 5.6M     | 14.5M / 3.9M |
+| 64 B   | 64 B     | **48.2M / 22.8M**   | 33.3M / 9.5M | 44.8M / 9.2M     | 31.4M / 5.7M |
+| 256 B  | 256 B    | **17.8M / 8.5M**    | 15.4M / 4.0M | 17.6M / 3.8M     | 14.2M / 2.9M |
 
-Compared to udense, MTHT reads are 1.02–2.12x and inserts 1.30–2.31x the speed here, using 0.74–1.05x the memory.
+Compared to udense, MTHT reads are 1.01–2.24x and inserts 1.28–2.68x the speed here, using 0.74–1.05x the memory.
 
 
 ### short strings and 64-bit ints
@@ -148,7 +148,7 @@ Compared to udense, MTHT reads are 1.02–2.12x and inserts 1.30–2.31x the spe
 clang 23, `-O2`, best of 3.
 ```sh
 clang++ -O2 -std=c++20 -march=native -Iinclude \
-        -Ipeers/robin-map-master/include -Ipeers/ankerl-unordered_dense \
+        -Ipeers/robin-map-master/include -Ipeers/ankerl-unordered_dense/include/ankerl \
         bench/mthtbench.cpp -o temp/mthtbench.exe
 ./temp/mthtbench.exe --suite=peers --n1=20   # reads and inserts, integer keys
 ./temp/mthtbench.exe --suite=strings         # reads and inserts, string keys
@@ -159,28 +159,30 @@ clang++ -O2 -std=c++20 -march=native -Iinclude \
 
 #### strings
 
+Keys are mixed length: 70% at 1–16 B, 27% at 17–64 B, 3% at 65–256 B.
+
 |                         | reads/s   | inserts/s | bytes/key |
 |-------------------------|-----------|-----------|-----------|
-| MTHT                    | 27.6M     | 15.1M     | **55.1**  |
-| tsl::robin_map          | 20.1M     | 15.2M     | 85.3      |
-| ankerl::unordered_dense | **30.8M** | **19.9M** | 70.1      |
-| std::unordered_map      | 19.7M     | 8.3M      | 78.0      |
+| MTHT                    | 28.3M     | 17.3M     | **55.1**  |
+| tsl::robin_map          | 20.0M     | 15.0M     | 85.3      |
+| ankerl::unordered_dense | **30.1M** | **19.1M** | 70.1      |
+| std::unordered_map      | 19.3M     | 8.2M      | 78.0      |
 
 #### ints
 
 |                         | reads/s    | inserts/s  | bytes/key |
 |-------------------------|------------|------------|-----------|
-| MTHT                    | 81.4M      | 26.6M      | 24.0      |
-| tsl::robin_map          | 80.3M      | 59.6M      | 32.0      |
-| ankerl::unordered_dense | **196.9M** | **105.8M** | **23.3**  |
-| std::unordered_map      | 117.6M     | 16.7M      | 42.7      |
+| MTHT                    | 90.9M      | 39.2M      | 24.0      |
+| tsl::robin_map          | 79.2M      | 60.5M      | 32.0      |
+| ankerl::unordered_dense | **198.9M** | **105.8M** | **23.3**  |
+| std::unordered_map      | 126.2M     | 17.6M      | 42.7      |
 
 #### load sweep (ints)
 
 | load | reads/s | probes/read |
 |---|---|---|
-| 0.083 | 190.5M | 1.04 |
-| 0.410 | 116.2M | 1.25 |
-| 0.686 | 79.6M | 1.54 |
+| 0.083 | 219.8M | 1.04 |
+| 0.410 | 131.7M | 1.25 |
+| 0.686 | 88.4M  | 1.54 |
 
 

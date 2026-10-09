@@ -470,42 +470,18 @@ public:
         if (!val) return false; // key outside [MIN_KEY_BYTES, MAX_KEY_BYTES]
 
         const uint64_t hh = hash_bytes(key, key_len);
-        const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
-        const uint8_t fp = fingerprint_of_hash(hh);
-
-        // Existing key: keep the fingerprint, D_max and state bits; only the
-        // pointer changes. slot_for_key finds it in T1 or T2 wherever it lives.
-        bool in_t1 = false;
-        if (Entry* e = slot_for_key(key, key_len, h, fp, in_t1)) {
-            uint64_t tag = e->word & ~PTR_MASK;
-            e->word = tag | encode_pointer(val);
-            return true;
-        }
-
-        return place_into(key, key_len, hh, h, val);
+        return insert_place(key, key_len, hh, val, true);
     }
 
-    // insert_key for an 8-byte key: identical except every probe uses the
-    // length-free predicate. Kept separate rather than folded in so the
+    // insert_key for an 8-byte key: identical except the placement probe uses
+    // the length-free predicate. Kept separate rather than folded in so the
     // non-8 path keeps its single runtime test.
     bool insert_key_8(const void* key, const void* bytes, std::size_t bytes_len) {
         void* val = key_store_.store(key, 8, bytes, bytes_len);
         if (!val) return false;
 
         const uint64_t hh = hash_key(read_word(key));
-        const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
-        const uint8_t fp = fingerprint_of_hash(hh);
-
-        bool in_t1 = false;
-        if (Entry* e = slot_for_key_8(key, h, fp, in_t1)) {
-            uint64_t tag = e->word & ~PTR_MASK;
-            e->word = tag | encode_pointer(val);
-            return true;
-        }
-
-        // The placement ladder has no key comparison in it, so it needs no
-        // 8-byte variant: only the probe paths did.
-        return place_into(key, 8, hh, h, val);
+        return insert_place_8(key, hh, val, true);
     }
 
     // The live slot holding the key span, or nullptr -- the probe order find()
@@ -593,80 +569,160 @@ public:
         return nullptr;
     }
 
-    // The placement ladder, steps 1-5 below.
-    bool place_into(const void* key, std::size_t key_len, uint64_t hh, uint64_t h, void* val) {
+    // Insert-or-place, one pass over {home, home+1, home-1}. The three states
+    // are read once here and serve both jobs: they decide whether an existing
+    // key occupies a slot (replace) and, failing that, which slot the new key
+    // takes. The old split -- slot_for_key's probe, then place_into's ladder
+    // re-reading the same three slots -- read each of them twice.
+    //
+    // `check_existing` is false on the grow path, where the freshly emptied
+    // table cannot hold a duplicate of the key being re-placed.
+    bool insert_place(const void* key, std::size_t key_len, uint64_t hh, void* val,
+                      bool check_existing) {
+        const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
         const uint8_t fp = fingerprint_of_hash(hh);
         Entry& home = t1_[h];
-        uint8_t state = get_state(home);
+        Entry& right = t1_[(h + 1) & mask1_];
+        Entry& left = t1_[(h - 1) & mask1_];
+        const uint8_t s_home = get_state(home);
+        const uint8_t s_right = get_state(right);
+        const uint8_t s_left = get_state(left);
 
+        // Replace an existing key. Same probe order as slot_for_key: home,
+        // then +1, then -1, then T2. Only the pointer changes; fingerprint,
+        // state and D_max bits survive.
+        if (check_existing) {
+            Entry* hit = nullptr;
+            if (s_home == ST_OFF_ZERO && slot_holds_fp(home, key, key_len, fp)) {
+                hit = &home;
+            } else if (slot_holds_fp(right, key, key_len, fp)) {
+                hit = &right;
+            } else if (slot_holds_fp(left, key, key_len, fp)) {
+                hit = &left;
+            } else {
+                const uint8_t max_offset = get_t2_max_offset(home);
+                if (max_offset) hit = slot_for_key_T2(h, key, key_len, fp, max_offset);
+            }
+            if (hit) {
+                hit->word = (hit->word & ~PTR_MASK) | encode_pointer(val);
+                return true;
+            }
+        }
+
+        // Place the new key, reusing the states already read.
+        //
         // 1. Direct placement in the home slot.
-        if (state == ST_EMPTY) {
+        if (s_home == ST_EMPTY) {
             write_slot(home, fp, val, ST_OFF_ZERO);
             ++count_;
             return true;
         }
 
-        // 2. First free neighbor, biased to keep the entry in h's cache line
-        // (h+1 unless h is the last slot of its line).
-        int cache_slot = static_cast<int>(h & 3);
-        int first_pref = (cache_slot == 3) ? -1 : +1;
-        int second_pref = -first_pref;
-        uint64_t first_idx = (h + first_pref) & mask1_;
-        uint64_t second_idx = (h + second_pref) & mask1_;
-        uint8_t first_state = (first_pref == +1) ? ST_OFF_POS : ST_OFF_NEG;
-        uint8_t second_state = (second_pref == +1) ? ST_OFF_POS : ST_OFF_NEG;
-
-        if (get_state(t1_[first_idx]) == ST_EMPTY) {
-            write_slot(t1_[first_idx], fp, val, first_state);
+        // 2. First free neighbor: the right one first, always. Reads probe +1
+        //    before -1, and the right shift below keeps displaced keys on that
+        //    side, so rightward placement is the one the probe finds soonest.
+        if (s_right == ST_EMPTY) {
+            write_slot(right, fp, val, ST_OFF_POS);
             ++count_;
             return true;
         }
-        if (get_state(t1_[second_idx]) == ST_EMPTY) {
-            write_slot(t1_[second_idx], fp, val, second_state);
+        if (s_left == ST_EMPTY) {
+            write_slot(left, fp, val, ST_OFF_NEG);
             ++count_;
             return true;
         }
 
-        // 3. On the right cache-line edge, shift h-1 to h-2 to free h-1 for the
-        //    home slot's key. The mover must be at offset 0 (it keeps its own
-        //    home) and h-2 free; the shifted tag is then ST_OFF_NEG by
-        //    construction.
-        uint64_t left_idx = (h - 1) & mask1_;
-        uint64_t far_left = (h - 2) & mask1_;
-        if (cache_slot == 3 && get_state(t1_[left_idx]) == ST_OFF_ZERO &&
-            get_state(t1_[far_left]) == ST_EMPTY) {
-            shift_entry(t1_[left_idx], t1_[far_left], ST_OFF_NEG);
-            write_slot(t1_[left_idx], fp, val, ST_OFF_NEG);
+        // 3. Both neighbors taken: open h+1 by shifting the entry there into
+        //    h+2, if h+2 is free and that entry can still reach its own home
+        //    from h+2. The new key then takes h+1 at offset +1 -- the slot the
+        //    probe checks first.
+        const uint64_t far_right = (h + 2) & mask1_;
+        if (get_state(t1_[far_right]) == ST_EMPTY &&
+            can_shift_right_into(right)) {
+            shift_entry(right, t1_[far_right], shifted_right_tag(s_right));
+            write_slot(right, fp, val, ST_OFF_POS);
             ++count_;
             return true;
         }
 
-        // 4. Greedy rightward ripple: open a hole at h+1 by shifting the run
-        //    right to the first empty slot. Before anything moves, every entry
-        //    in the run is checked against its own home (not its tag) -- it must
-        //    be able to move right and still land in {home-1, home, home+1}.
-        //    One entry failing the test abandons the whole ripple.
-        //
-        for (uint64_t k = h + 1; k < h + 5; ++k) {
-            uint64_t idx = k & mask1_;
-            uint8_t k_state = get_state(t1_[idx]);
-            if (k_state == ST_EMPTY) {
-                for (uint64_t j = idx; j != ((h + 1) & mask1_); j = (j - 1) & mask1_) {
-                    uint64_t prev = (j - 1) & mask1_;
-                    shift_entry(t1_[prev], t1_[j],
-                                shifted_right_tag(get_state(t1_[prev])));
-                }
-                write_slot(t1_[(h + 1) & mask1_], fp, val, ST_OFF_POS);
-                ++count_;
+        // 4. Mirror on the left: open h-1 by shifting the entry there into h-2,
+        //    if h-2 is free and that entry can still reach its own home from
+        //    h-2. The new key then takes h-1 at offset -1.
+        const uint64_t far_left = (h - 2) & mask1_;
+        if (get_state(t1_[far_left]) == ST_EMPTY &&
+            can_shift_left_into(left)) {
+            shift_entry(left, t1_[far_left], shifted_left_tag(s_left));
+            write_slot(left, fp, val, ST_OFF_NEG);
+            ++count_;
+            return true;
+        }
+
+        // 5. Neither neighbor can be cleared by a single shift: spill into T2.
+        //    No ripple -- one shift each way, then the spill.
+        return insert_into_T2(hh, h, key, key_len, val);
+    }
+
+    // insert_place for an 8-byte key: same body, length-free probes.
+    bool insert_place_8(const void* key, uint64_t hh, void* val, bool check_existing) {
+        const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
+        const uint8_t fp = fingerprint_of_hash(hh);
+        Entry& home = t1_[h];
+        Entry& right = t1_[(h + 1) & mask1_];
+        Entry& left = t1_[(h - 1) & mask1_];
+        const uint8_t s_home = get_state(home);
+        const uint8_t s_right = get_state(right);
+        const uint8_t s_left = get_state(left);
+
+        if (check_existing) {
+            Entry* hit = nullptr;
+            if (s_home == ST_OFF_ZERO && slot_holds_fp_8(home, key, fp)) {
+                hit = &home;
+            } else if (slot_holds_fp_8(right, key, fp)) {
+                hit = &right;
+            } else if (slot_holds_fp_8(left, key, fp)) {
+                hit = &left;
+            } else {
+                const uint8_t max_offset = get_t2_max_offset(home);
+                if (max_offset) hit = slot_for_key_T2_8(h, key, fp, max_offset);
+            }
+            if (hit) {
+                hit->word = (hit->word & ~PTR_MASK) | encode_pointer(val);
                 return true;
             }
-            if (!can_shift_right_into(t1_[idx], idx + 1)) {
-                break; // blocked: spill to T2, leaving the run in place
-            }
         }
 
-        // 5. Fallback: spill into T2.
-        return insert_into_T2(hh, h, key, key_len, val);
+        if (s_home == ST_EMPTY) {
+            write_slot(home, fp, val, ST_OFF_ZERO);
+            ++count_;
+            return true;
+        }
+        if (s_right == ST_EMPTY) {
+            write_slot(right, fp, val, ST_OFF_POS);
+            ++count_;
+            return true;
+        }
+        if (s_left == ST_EMPTY) {
+            write_slot(left, fp, val, ST_OFF_NEG);
+            ++count_;
+            return true;
+        }
+        const uint64_t far_right = (h + 2) & mask1_;
+        if (get_state(t1_[far_right]) == ST_EMPTY &&
+            can_shift_right_into(right)) {
+            shift_entry(right, t1_[far_right], shifted_right_tag(s_right));
+            write_slot(right, fp, val, ST_OFF_POS);
+            ++count_;
+            return true;
+        }
+        const uint64_t far_left = (h - 2) & mask1_;
+        if (get_state(t1_[far_left]) == ST_EMPTY &&
+            can_shift_left_into(left)) {
+            shift_entry(left, t1_[far_left], shifted_left_tag(s_left));
+            write_slot(left, fp, val, ST_OFF_NEG);
+            ++count_;
+            return true;
+        }
+        return insert_into_T2(hh, h, key, 8, val);
     }
 
     // Returns the stored bytes for the key, or nullptr. Three key forms, as in
@@ -848,16 +904,11 @@ private:
         return p;
     }
 
-    // Can the entry in `src` move one slot right, into `dest`, and still lie
-    // within its own ternary neighbourhood? Taken from the key's real home, not
-    // the stored tag.
-    bool can_shift_right_into(const Entry& src, uint64_t dest_slot) const {
-        uint8_t st = get_state(src);
-        if (st == ST_EMPTY) return true;
-        if (st == ST_OFF_POS) return false; // already at home+1
-        uint64_t home = home_slot_of(decode_pointer(src.word));
-        uint64_t delta = (dest_slot - home) & mask1_;
-        return delta == 0 || delta == 1 || delta == mask1_;
+    // Can the entry in `src` move one slot right and still lie within its own
+    // ternary neighbourhood? The stored tag is the offset from home, so the
+    // move is legal unless the entry already sits at home+1.
+    bool can_shift_right_into(const Entry& src) const {
+        return get_state(src) != ST_OFF_POS;
     }
 
     // The tag an entry carries after moving one slot right, closing one slot of
@@ -865,6 +916,18 @@ private:
     // becomes POS. POS never reaches here -- can_shift_right_into rejects it.
     static uint8_t shifted_right_tag(uint8_t old_state) {
         return (old_state == ST_OFF_NEG) ? ST_OFF_ZERO : ST_OFF_POS;
+    }
+
+    // Mirror of can_shift_right_into: legal unless the entry sits at home-1.
+    bool can_shift_left_into(const Entry& src) const {
+        return get_state(src) != ST_OFF_NEG;
+    }
+
+    // The tag an entry carries after moving one slot left, opening one slot of
+    // the gap to its home: POS (home is one to the left) becomes ZERO, ZERO
+    // becomes NEG. NEG never reaches here -- can_shift_left_into rejects it.
+    static uint8_t shifted_left_tag(uint8_t old_state) {
+        return (old_state == ST_OFF_POS) ? ST_OFF_ZERO : ST_OFF_NEG;
     }
 
     // After `slot` frees, pull a key at `slot ± 1` whose own home is `slot`
@@ -975,7 +1038,8 @@ private:
         count_ = t2_count_ = 0;
 
         // T1 entries first, then T2: re-placing T1 while the table is still
-        // empty keeps its neighbourhoods sparse, so fewer entries spill.
+        // empty keeps its neighbourhoods sparse, so fewer entries spill. The
+        // new table holds no duplicates, so the replace probe is skipped.
         for (std::size_t i = 0; i < old_n1; ++i) {
             const Entry& e = old_t1[i];
             if (get_state(e) == ST_EMPTY) continue;
@@ -983,7 +1047,7 @@ private:
             std::size_t klen = key_len_at(val);
             const void* k = key_ptr_at(val);
             const uint64_t hh = hash_bytes(k, klen);
-            place_into(k, klen, hh, fast_map(hh, static_cast<uint64_t>(n1_)), val);
+            insert_place(k, klen, hh, val, false);
         }
         for (std::size_t i = 0; i < old_n2; ++i) {
             const Entry& e = old_t2[i];
@@ -993,7 +1057,7 @@ private:
             std::size_t klen = key_len_at(val);
             const void* k = key_ptr_at(val);
             const uint64_t hh = hash_bytes(k, klen);
-            place_into(k, klen, hh, fast_map(hh, static_cast<uint64_t>(n1_)), val);
+            insert_place(k, klen, hh, val, false);
         }
 
         std::free(old_t1);
