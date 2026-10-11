@@ -925,8 +925,8 @@ private:
             for (int dir = -1; dir <= 1; dir += 2) {
                 uint64_t from = (gap + (uint64_t)dir) & mask1_;
                 const Entry& src = t1_[from];
-                if (get_state(src) == ST_EMPTY) continue;
-                if (home_slot_of(decode_pointer(src.word)) != gap) continue;
+                uint8_t st = get_state(src);
+                if (st != (dir < 0 ? ST_OFF_NEG : ST_OFF_POS)) continue;
                 shift_entry(t1_[from], t1_[gap], ST_OFF_ZERO);
                 gap = from;
                 moved = true;
@@ -934,16 +934,6 @@ private:
             }
             if (!moved) break;
         }
-    }
-
-private:
-    // Home bucket of the key in the record at `val` -- for callers that hold
-    // only the record pointer.
-    uint64_t home_slot_of(const void* val) const {
-        return home_slot_of(key_ptr_at(val), key_len_at(val));
-    }
-    uint64_t home_slot_of(const void* key, std::size_t key_len) const {
-        return fast_map(hash_(key, key_len), static_cast<uint64_t>(n1_));
     }
 
     bool insert_into_T2(uint64_t hh, uint64_t h, void* val) {
