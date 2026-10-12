@@ -66,33 +66,47 @@ Header-only. Copy `include/mtht.hpp` or add `-Iinclude`.
 ```cpp
 #include "mtht.hpp"
 
-// n1 slots, and store_bytes, the key store's initial size in bytes (0 = 4 KB,
-// the default). Size it for the keys and values you expect. T2 opens at n1/8.
-mtht::Table t(1u << 20, 64u << 20);
+// make a table
+std::size_t slot_count = 1u << 16;
+std::size_t kv_store_bytes = 64u << 20;  // Default is a 4kb initial block.
+mtht::Table table(slot_count, kv_store_bytes);
 
-// Integer key.
-uint64_t k = 12345;
-MyValue v{};
-t.insert(k, &v, sizeof v);
-MyValue* got = static_cast<MyValue*>(t.find(k));
-t.erase(k);
+// utility
+std::size_t occupied = table.size();
 
-// String key: std::string, string literal, or string_view. The bytes are not
-// owned; keep them alive for the call.
-std::string name = "hello";
-t.insert(name, &v, sizeof v);
-MyValue* s = static_cast<MyValue*>(t.find(name));
-t.erase(name);
+// strings
+std::string key = "user-1042";
+std::string val = "ada@example.com";
+table.insert(key, val);
+std::string email = table.find_str(key);
 
-// Raw byte-span key: key bytes then key length. Use when the key is neither an
-// integer nor a std::string.
-const char raw[6] = {'h','e','l','l','o','!'};
-t.insert(raw, sizeof raw, &v, sizeof v);
-MyValue* r = static_cast<MyValue*>(t.find(raw, sizeof raw));
-t.erase(raw, sizeof raw);
+// ints
+std::uint64_t key = 42;
+std::uint64_t val = 1;
+table.insert(key, &val, sizeof val);
+std::uint64_t* got = static_cast<std::uint64_t*>(table.find(key));
+
+// raw bytes
+const char key[4] = {'a', 'b', 'c', 'd'};
+std::size_t key_len = sizeof key;
+std::uint8_t val[64] = {};
+table.insert(key, key_len, val, sizeof val);
+std::uint8_t* got = static_cast<std::uint8_t*>(table.find(key, key_len));
+table.erase(key, key_len);
+
+// custom hash functions
+struct Fnv {
+    // hash a span, len != 8
+    std::uint64_t operator()(const void* p, std::size_t len) const { ... }
+    // hash a 8-byte key
+    std::uint64_t operator()(const void* p) const { ... }
+};
+std::size_t slot_count = 1u << 16;
+mtht::BasicTable<Fnv> custom_table(slot_count);
 ```
 
-`insert` returns false for an empty key, a key longer than 256 bytes, or a full overflow region. `find` returns nullptr on a miss.
+`insert` returns false (failure) if key length is 0 or >256 bytes.
+ On a miss: `find` returns nullptr, `find_str` returns `""`.
 
 Build: `clang++ -O2 -std=c++20 -march=native -Iinclude your_app.cpp`. Needs C++20.
 
