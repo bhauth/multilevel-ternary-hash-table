@@ -38,8 +38,6 @@ static constexpr uint8_t DMAX_SENTINEL = 63;
 
 static constexpr int SHIFT_RATIO = 3;
 
-static constexpr double T2_GROW_LOAD = 0.75;
-
 static constexpr uint64_t PTR_MASK = 0x0000FFFFFFFFFFFFULL;
 static constexpr uint64_t FP_SHIFT = 48;
 static constexpr uint64_t FP_MASK = 0xFFULL;
@@ -55,11 +53,6 @@ inline uint64_t fast_map(uint64_t hash, uint64_t capacity) {
 
 inline uint8_t get_state(const Entry& e) {
     return static_cast<uint8_t>((e.word >> STATE_SHIFT) & STATE_MASK);
-}
-
-inline void set_state(Entry& e, uint8_t state) {
-    e.word = (e.word & ~(STATE_MASK << STATE_SHIFT)) |
-             (static_cast<uint64_t>(state & 0x03) << STATE_SHIFT);
 }
 
 inline uint8_t get_t2_max_offset(const Entry& e) {
@@ -227,10 +220,6 @@ inline uint64_t hash_bytes(const void* p, std::size_t len) {
     return hash_key(static_cast<uint64_t>(std::hash<std::string_view>{}(sv)));
 }
 
-inline uint8_t fingerprint_bytes(const void* p, std::size_t len) {
-    return fingerprint_of_hash(hash_bytes(p, len));
-}
-
 inline uint8_t get_fingerprint(const Entry& e) {
     return static_cast<uint8_t>((e.word >> FP_SHIFT) & FP_MASK);
 }
@@ -313,8 +302,6 @@ inline bool t2_holds_fp(const Entry& e, const void* key, std::size_t len, uint8_
 //
 // The span form is only called with len != 8 -- an 8-byte key is routed to the
 // 8-byte form first -- so its length-8 case is free to differ.
-//
-// the key: a policy returning the key unchanged degenerates when they repeat.
 struct Hash {
     uint64_t operator()(const void* p, std::size_t len) const {
         return hash_bytes(p, len);
@@ -484,11 +471,6 @@ public:
     double load2() const { return static_cast<double>(t2_count_) / static_cast<double>(n2_); }
 
     std::size_t key_store_bytes() const { return key_store_.bytes_used(); }
-
-    const Entry* raw_t1() const { return t1_; }
-    const Entry* raw_t2() const { return t2_; }
-    Entry* raw_t1() { return t1_; }
-    Entry* raw_t2() { return t2_; }
 
     void clear() {
         std::memset(t1_, 0, n1_ * sizeof(Entry));

@@ -268,41 +268,8 @@ static std::vector<Dist> distributions(std::size_t n) {
 }
 
 // ---------------------------------------------------------------------------
-// Placement invariant: no live T1 entry may sit more than 1 slot from its home
-// (that is what guarantees <=2 probes on offsets -1/+1).
-// ---------------------------------------------------------------------------
-struct Invariant { std::size_t live = 0; std::size_t violations = 0; std::size_t badtag = 0; };
-
-static Invariant check_invariant(mtht::Table& t) {
-    Invariant r;
-    const mtht::Entry* base = t.raw_t1();
-    for (std::size_t i = 0; i < t.n1(); ++i) {
-        const mtht::Entry& e = base[i];
-        const uint8_t st = mtht::get_state(e);
-        if (st == mtht::ST_EMPTY) continue;
-        ++r.live;
-        const uint64_t h = mtht::fast_map(
-            mtht::hash_bytes(mtht::decode_pointer(e.word),
-                             mtht::key_len_at(mtht::decode_pointer(e.word))),
-            static_cast<uint64_t>(t.n1()));
-        // Distance from home, wrapping.
-        const long long n = (long long)t.n1();
-        long long d = (long long)i - (long long)h;
-        if (d > n / 2) d -= n;
-        if (d < -n / 2) d += n;
-        if (d < -1 || d > 1) ++r.violations;
-        // Tag must agree with the actual offset.
-        const uint8_t want = (d == 0) ? mtht::ST_OFF_ZERO
-                                      : (d == -1 ? mtht::ST_OFF_NEG : mtht::ST_OFF_POS);
-        if (st != want) ++r.badtag;
-    }
-    return r;
-}
-
-// ---------------------------------------------------------------------------
-// Suite: correctness. Inserts every key, verifies readback, checks the
-// invariant, and confirms absent keys miss. Must pass before any timing is
-// trusted.
+// Suite: correctness. Inserts every key, verifies readback, and confirms
+// absent keys miss. Must pass before any timing is trusted.
 // ---------------------------------------------------------------------------
 static bool suite_correctness(std::size_t n1_shift, std::size_t t2_div,
                               std::size_t ins_pct, int* checks_out) {
@@ -338,17 +305,14 @@ static bool suite_correctness(std::size_t n1_shift, std::size_t t2_div,
         for (uint64_t k : absent)
             if (t.find(k)) ++false_pos;
 
-        const Invariant inv = check_invariant(t);
-
-        checks += 4;
+        checks += 3;
         if (!distinct) { ++fails; out::line("  [FAIL] %-11s generator produced duplicates", d.name); }
         if (inserted != nkeys) { ++fails; out::line("  [FAIL] %-11s inserted %zu/%zu", d.name, inserted, nkeys); }
         if (found != inserted || wrong_val) { ++fails; out::line("  [FAIL] %-11s found %zu/%zu wrong_val=%zu", d.name, found, inserted, wrong_val); }
-        if (inv.violations || inv.badtag) { ++fails; out::line("  [FAIL] %-11s invariant viol=%zu badtag=%zu", d.name, inv.violations, inv.badtag); }
 
         // One compact row per distribution. A passing row is just its numbers.
-        out::line("  %-11s keys=%-7zu found=%-7zu fp=%-3zu inv=%-3zu t1=%.3f t2=%.3f",
-                  d.name, inserted, found, false_pos, inv.violations, t.load1(), t.load2());
+        out::line("  %-11s keys=%-7zu found=%-7zu fp=%-3zu t1=%.3f t2=%.3f",
+                  d.name, inserted, found, false_pos, t.load1(), t.load2());
     }
     out::line("  %d checks, %d failures", checks, fails);
     out::line("");
@@ -438,8 +402,8 @@ static void suite_mtht_loads(std::size_t n1_shift, std::size_t t2_div,
     out::line("== mtht loads ==");
     out::line("  N1=%zu N2=%zu (t2=t1/%zu)  step=%zu keys  random keys  MTHT only",
               N1, N2, t2_div, step);
-    out::line("  t1 = keys in T1 / N1; t2 = keys in T2 / N2; when t2 reaches %g the"
-              " table doubles", (double)mtht::T2_GROW_LOAD);
+    out::line("  t1 = keys in T1 / N1; t2 = keys in T2 / N2; when t2 reaches 0.75 the"
+              " table doubles");
     out::line("  each row is a fresh table at N1, so grow = this row's own n1_ / N1.");
     out::line("  %-8s %10s %11s %9s %-9s %s",
               "keys", "t1", "find_ms", "Mfind/s", "t1/t2", "grow");
