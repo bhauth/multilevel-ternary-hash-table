@@ -7,7 +7,8 @@ This is a hashtable which:
 - uses a novel design
 - has good performance when keys or values are >8 byte strings
 - uses a relatively small amount of code
-- has stable references to keys and values
+- can recover an item's key + value from a single pointer
+- can be iterated fast in insertion order
 
 I thought of the concept for this in 2019, and implemented a proof of concept in 2020. I didn't have the low-level programming knowledge or patience to get good performance from it, but now, LLMs do. Also, for various reasons, I need something public and technical that was made with AI. So I had Deepseek V4.1 Flash make this, but I really had to push it.
 
@@ -67,8 +68,9 @@ Header-only. Copy `include/mtht.hpp` or add `-Iinclude`.
 #include "mtht.hpp"
 
 // make a table
-std::size_t slot_count = 1u << 16;
-std::size_t kv_store_bytes = 64u << 20;  // Default is a 4kb initial block.
+std::size_t slot_count = 1u << 16;  // Initial slots; can grow.
+// Initial key-value storage; can grow. Default is 4kb.
+std::size_t kv_store_bytes = 64u << 20;
 mtht::Table table(slot_count, kv_store_bytes);
 
 // utility
@@ -80,21 +82,56 @@ std::string val = "ada@example.com";
 table.insert(key, val);
 std::string email = table.find_str(key);
 
-// ints
-std::uint64_t key = 42;
-std::uint64_t val = 1;
-table.insert(key, &val, sizeof val);
-std::uint64_t* got = static_cast<std::uint64_t*>(table.find(key));
+// a value stored as a pointer
+int foo = 42;
+int* p = &foo;
+table.insert("cfg", &p, sizeof p);
+int* got = table.find_as<int*>("cfg");  // nullptr if absent
+
+// a value copied out as any fixed-size type
+table.insert("answer", &foo, sizeof foo);
+int answer = table.find_as<int>("answer");
 
 // raw bytes
 const char key[4] = {'a', 'b', 'c', 'd'};
 std::size_t key_len = sizeof key;
 std::uint8_t val[64] = {};
 table.insert(key, key_len, val, sizeof val);
-std::uint8_t* got = static_cast<std::uint8_t*>(table.find(key, key_len));
+void* entry = table.find(key, key_len);
+std::string_view k = mtht::read_key(entry);   // the stored key
+std::string_view v = mtht::read_str(entry);   // its value
+int answer = mtht::read_as<int>(table.find("answer"));  // 0 if absent
 table.erase(key, key_len);
 
-// custom hash functions
+// get a pointer to a stored item (outlives an erase)
+void* held = table.find(key, key_len);
+if (mtht::ptr_is_live(held)) { /* value still valid */ }
+
+// iterate every live entry, in insertion order
+auto cur = table.iter_start();
+while (void* entry = table.iter(cur)) {
+    // iter gives the same item pointers as find()
+    std::string_view k = mtht::read_key(entry);
+    std::string_view v = mtht::read_str(entry);
+}
+
+// iterate a function over the live table entries
+table.map([](std::string_view k, std::string_view v) {
+    // ...
+});
+
+// return an array of function results over the live table entries
+std::unique_ptr<std::size_t[]> lens = table.map(
+    [](std::string_view k, std::string_view v) { return k.size() + v.size(); }
+);
+
+// walk the same table twice at once, one state per walk
+auto a = table.iter_start();
+auto b = table.iter_start();
+void* from_a = table.iter(a);
+void* from_b = table.iter(b);  // independent of a
+
+// using custom hash functions
 struct Fnv {
     // hash a span, len != 8
     std::uint64_t operator()(const void* p, std::size_t len) const { ... }
@@ -105,16 +142,13 @@ std::size_t slot_count = 1u << 16;
 mtht::BasicTable<Fnv> custom_table(slot_count);
 ```
 
-`insert` returns false (failure) if key length is 0 or >256 bytes.
- On a miss: `find` returns nullptr, `find_str` returns `""`.
-
-Build: `clang++ -O2 -std=c++20 -march=native -Iinclude your_app.cpp`. Needs C++20.
+On a miss: `find` returns nullptr, `find_str` returns `""`.
 
 
 ## benchmarks
 
 
-### long keys and values
+### with various strings
 
 #### code
 
@@ -131,30 +165,30 @@ clang++ -O2 -std=c++20 -march=native -Iinclude \
 
 Reads/s and inserts/s. Sizes in bytes.
 
-| keys   | value    | MTHT                | robin        | udense            | umap         |
-|--------|----------|---------------------|--------------|-------------------|--------------|
-| 4–24 B | 16–128 B | **43.4M / 14.8M**   | 34.0M / 9.2M | 39.6M / 10.2M    | 23.6M / 6.5M |
-| 8 B    | 256 B    | **122.2M / 12.8M**  | 61.0M / 5.8M | 66.0M / 5.8M     | 36.1M / 4.8M |
-| 256 B  | 8 B      | **9.3M / 8.5M**     | 7.1M / 4.3M  | 7.6M / 4.7M      | 6.4M / 2.9M  |
-| 64 B   | 64 B     | **37.8M / 9.9M**    | 17.7M / 5.7M | 30.6M / 6.8M     | 20.4M / 4.0M |
-| 256 B  | 256 B    | **7.5M / 5.6M**     | 5.8M / 2.5M  | 6.7M / 3.0M      | 5.6M / 2.1M  |
+| keys   | value    | MTHT               | robin        | udense        | umap         |
+|--------|----------|--------------------|--------------|---------------|--------------|
+| 4–24 B | 16–128 B | **44.3M / 16.0M**  | 33.5M / 8.9M | 39.4M / 11.2M | 23.4M / 6.1M |
+| 8 B    | 256 B    | **111.6M / 14.0M** | 60.5M / 5.7M | 65.2M / 6.0M  | 36.8M / 4.7M |
+| 256 B  | 8 B      | **9.4M / 8.1M**    | 6.1M / 3.9M  | 7.5M / 4.8M   | 6.0M / 2.9M  |
+| 64 B   | 64 B     | **39.7M / 12.8M**  | 16.3M / 5.7M | 21.8M / 7.1M  | 15.3M / 4.1M |
+| 256 B  | 256 B    | **7.9M / 5.7M**    | 5.2M / 2.7M  | 6.7M / 3.1M   | 5.5M / 2.2M  |
 
-Compared to udense, MTHT reads are 1.10–1.85x and inserts 1.45–2.21x the speed here, using 0.77–1.06x the memory.
+Compared to udense, MTHT reads are 1.12–1.82x and inserts 1.43–2.33x the speed here, using 0.77–1.06x the memory.
 
 #### comparison : 16k keys
 
-| keys   | value    | MTHT                | robin        | udense            | umap         |
-|--------|----------|---------------------|--------------|-------------------|--------------|
-| 4–24 B | 16–128 B | **50.0M / 18.2M**   | 35.6M / 13.0M | 44.7M / 14.2M    | 28.0M / 8.3M |
-| 8 B    | 256 B    | **194.4M / 20.9M**  | 62.5M / 7.3M | 86.8M / 7.8M     | 48.8M / 5.9M |
-| 256 B  | 8 B      | **19.3M / 14.1M**   | 15.7M / 5.5M | 18.0M / 5.6M     | 14.5M / 3.9M |
-| 64 B   | 64 B     | **48.2M / 22.8M**   | 33.3M / 9.5M | 44.8M / 9.2M     | 31.4M / 5.7M |
-| 256 B  | 256 B    | **17.8M / 8.5M**    | 15.4M / 4.0M | 17.6M / 3.8M     | 14.2M / 2.9M |
+| keys   | value    | MTHT               | robin         | udense        | umap         |
+|--------|----------|--------------------|---------------|---------------|--------------|
+| 4–24 B | 16–128 B | **51.4M / 24.2M**  | 35.9M / 13.5M | 46.2M / 15.4M | 29.0M / 8.6M |
+| 8 B    | 256 B    | **183.1M / 21.5M** | 65.2M / 8.0M  | 88.4M / 7.4M  | 49.4M / 6.1M |
+| 256 B  | 8 B      | **19.4M / 13.3M**  | 16.1M / 5.9M  | 18.6M / 5.8M  | 14.4M / 3.8M |
+| 64 B   | 64 B     | **48.4M / 24.8M**  | 33.3M / 9.5M  | 44.8M / 9.4M  | 31.8M / 5.7M |
+| 256 B  | 256 B    | **18.6M / 10.6M**  | 15.9M / 4.1M  | 18.1M / 4.1M  | 14.4M / 2.8M |
 
-Compared to udense, MTHT reads are 1.01–2.24x and inserts 1.28–2.68x the speed here, using 0.74–1.05x the memory.
+Compared to udense, MTHT reads are 1.03–2.07x and inserts 1.57–2.91x the speed here, using 0.74–1.05x the memory.
 
 
-### short strings and 64-bit ints
+### with 64-bit int values
 
 #### code
 
@@ -171,32 +205,32 @@ clang++ -O2 -std=c++20 -march=native -Iinclude \
 `--n1=20` is a 2^20-slot table. `--no-log` skips the run log.
 
 
-#### strings
+#### string keys
 
 Keys are mixed length: 70% at 1–16 B, 27% at 17–64 B, 3% at 65–256 B.
 
 |                         | reads/s   | inserts/s | bytes/key |
 |-------------------------|-----------|-----------|-----------|
-| MTHT                    | 28.3M     | 17.3M     | **55.1**  |
-| tsl::robin_map          | 20.0M     | 15.0M     | 85.3      |
-| ankerl::unordered_dense | **30.1M** | **19.1M** | 70.1      |
-| std::unordered_map      | 19.3M     | 8.2M      | 78.0      |
+| MTHT                    | **26.3M** | 17.1M     | **58.4**  |
+| tsl::robin_map          | 17.2M     | 13.5M     | 85.3      |
+| ankerl::unordered_dense | 25.9M     | **19.2M** | 70.1      |
+| std::unordered_map      | 16.3M     | 7.7M      | 78.0      |
 
-#### ints
+#### int keys
 
 |                         | reads/s    | inserts/s  | bytes/key |
 |-------------------------|------------|------------|-----------|
-| MTHT                    | 90.9M      | 39.2M      | 24.0      |
-| tsl::robin_map          | 79.2M      | 60.5M      | 32.0      |
-| ankerl::unordered_dense | **198.9M** | **105.8M** | **23.3**  |
-| std::unordered_map      | 126.2M     | 17.6M      | 42.7      |
+| MTHT                    | 92.3M      | 43.5M      | 24.0      |
+| tsl::robin_map          | 81.8M      | 60.8M      | 32.0      |
+| ankerl::unordered_dense | **200.7M** | **107.3M** | **23.3**  |
+| std::unordered_map      | 121.0M     | 17.2M      | 42.7      |
 
 #### load sweep (ints)
 
-| load | reads/s | probes/read |
-|---|---|---|
-| 0.083 | 219.8M | 1.04 |
-| 0.410 | 131.7M | 1.25 |
-| 0.686 | 88.4M  | 1.54 |
+| load  | reads/s | probes/read |
+|-------|---------|-------------|
+| 0.083 | 197.9M  | 1.04        |
+| 0.411 | 125.5M  | 1.25        |
+| 0.686 | 87.3M   | 1.54        |
 
 

@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
         t0 = Clock::now();
         for (uint64_t k : c.keys) {
             const void* p = t.find(k);
-            if (p) sink += *static_cast<const uint64_t*>(p);
+            if (p) sink += *reinterpret_cast<const uint64_t*>(mtht::read_str(p).data());
         }
         double t_find_a = ms_since(t0);
         (void)sink;

@@ -75,7 +75,7 @@ static Result time_mtht(const std::vector<uint64_t>& keys,
         auto t0 = Clock::now();
         for (uint64_t k : keys) {
             const void* p = t.find(k);
-            if (p) sink += *static_cast<const uint64_t*>(p);
+            if (p) sink += *reinterpret_cast<const uint64_t*>(mtht::read_str(p).data());
         }
         double d = ms_since(t0);
         if (d < best) best = d;

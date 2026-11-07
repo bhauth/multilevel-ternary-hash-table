@@ -1,31 +1,24 @@
 // Multilevel Ternary Hash Table (MTHT)
-//
-// Layout: T1 is an open-addressing table whose keys live in a ternary
-// neighborhood {h-1, h, h+1} of their home bucket. Displaced keys are tagged
-// with a 2-bit state in the high bits of val_ptr. Keys that cannot fit spill
-// into T2, whose per-bucket displacement is bounded by a 6-bit D_max stored in
-// the home slot of T1.
 #ifndef MTHT_HPP
 #define MTHT_HPP
 
 #include <cstdint>
 #include <cstddef>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string_view>
 #include <string>
 #include <functional>
+#include <memory>
+#include <new>
+#include <type_traits>
 #include <vector>
 
 namespace mtht {
 
-// Entry for both tables, exactly 8 bytes so that 8 fit one 64-byte cache line.
-// The entry holds a fingerprint, not the key: the key lives once in the value
-// record the pointer reaches, and a fingerprint match is confirmed against it.
 struct alignas(8) Entry {
-    // [47..0] pointer to the value record, [55..48] 8-bit key fingerprint,
-    // [63..56] header byte: [57..56] 2-bit state, [63..58] 6-bit D_max.
     uint64_t word;
 };
 
@@ -39,20 +32,12 @@ enum : uint8_t {
     ST_OFF_POS = 3, // 11: offset +1 (home is slot_index - 1)
 };
 
-// T2-local state value. A T2 slot is only ever placed at ST_OFF_ZERO (a spill
-// has no ternary neighborhood), so the other two codes are free there; this one
-// marks a slot whose entry was erased. It keeps the slot from reading as
-// ST_EMPTY, so a forward T2 scan passes over it instead of stopping, and insert
-// may still reuse it. Not a displacement tag -- do not use it on a T1 slot.
 static constexpr uint8_t ST_TOMBSTONE = ST_OFF_NEG;
 
-// D_max sentinel: offset >= 63, lookup falls back to forward probing in T2.
 static constexpr uint8_t DMAX_SENTINEL = 63;
 
-// Shift between a T1 home bucket and its T2 base bucket: T2.size = T1.size >> 3.
 static constexpr int SHIFT_RATIO = 3;
 
-// T2 load at which the whole table doubles. Checked on the spill path only.
 static constexpr double T2_GROW_LOAD = 0.75;
 
 static constexpr uint64_t PTR_MASK = 0x0000FFFFFFFFFFFFULL;
@@ -63,15 +48,11 @@ static constexpr uint64_t STATE_MASK = 0x03ULL;
 static constexpr uint64_t DMAX_SHIFT = 58;
 static constexpr uint64_t DMAX_MASK = 0x3FULL;
 
-// Hash to bucket: rotate the bottom 2 bytes up to the top -- those are the bits
-// the fingerprint and other fields consume.
 inline uint64_t fast_map(uint64_t hash, uint64_t capacity) {
     uint64_t r = (hash << 16) | (hash >> 48);
     return r & (capacity - 1);
 }
 
-// Bitfield accessors for the words above. `state` is a value from the ST_*
-// enum (or ST_TOMBSTONE); `dmax` the bound from get_t2_max_offset.
 inline uint8_t get_state(const Entry& e) {
     return static_cast<uint8_t>((e.word >> STATE_SHIFT) & STATE_MASK);
 }
@@ -95,14 +76,14 @@ inline void* decode_pointer(uint64_t word) {
 }
 
 inline uint64_t encode_pointer(const void* p) {
-    uintptr_t addr = reinterpret_cast<uintptr_t>(p);
-    // x86-64 user addresses fit in 48 bits. Warn loudly rather than silently
-    // corrupting the pointer if that ever stops holding.
-    if (addr > PTR_MASK) {
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p));
+}
+
+inline void check_pointer_range(const void* p) {
+    if (reinterpret_cast<uintptr_t>(p) > PTR_MASK) {
         std::fprintf(stderr, "mtht: pointer above 48 bits: %p\n", p);
         std::abort();
     }
-    return static_cast<uint64_t>(addr);
 }
 
 // splitmix64 finalizer. Avalanches all 64 input bits, so keys 0 and ~0ULL are
@@ -116,40 +97,104 @@ inline uint64_t hash_key(uint64_t k) {
     return k;
 }
 
-// The 8 bytes at `p`, read as one word: an 8-byte key by value, whatever it
-// started life as (uint64_t, or 8 bytes of a string).
 inline uint64_t read_word(const void* p) {
     uint64_t w;
     std::memcpy(&w, p, 8);
     return w;
 }
 
-// The value record stores the whole key, so a fingerprint match is confirmed
-// exactly and no collision can return another key's value:
+// The value record is
 //
-//     [ key_bytes : len ][ len - 1 : 1 ][ value... ]
+//     [ data_len : 32 | key_len : 31 + live : 1 ][ key... ][ data... ]
 //
-// The table hands out a pointer to the value; the key is read back from that
-// pointer at fixed offsets from it. The length byte holds `len - MIN_KEY_BYTES`
-// so the 8-bit field spans 1..256 bytes (8..2048 bits).
-static constexpr std::size_t MIN_KEY_BYTES = 1;
-static constexpr std::size_t MAX_KEY_BYTES = 256; // MIN + 255
+// with the key first, so a find that has matched a fingerprint reads the key
+// bytes at the pointer it returns, and the record header sits behind it.
+//
+//     bits 63..32 data size, in bytes
+//     bits 31..1  key size, in bytes
+//     bit 0       0 while the key is live, 1 once it is erased
+//
+// Erasing flips bit 0 only: it is in the word that holds both lengths, so the
+// header stays exactly one load behind the key.
+//
+// A key length needs 32 bits to hold 2^31 itself, so the header spends its top
+// bit on liveness instead: key lengths are stored doubled in bits 31..1, which
+// holds 0 .. 2^30-1.
+// static constexpr std::size_t MAX_KEY_BYTES = (std::size_t(1) << 30) - 1;
 
-// Stored length byte for an actual key length.
-inline uint8_t encode_key_len(std::size_t len) {
-    return static_cast<uint8_t>(len - MIN_KEY_BYTES);
+static constexpr std::size_t PL_HEAD_BYTES = 8;
+
+static constexpr uint64_t PL_DEAD = 1ULL;
+static constexpr int PL_DATA_SHIFT = 32;
+static constexpr int PL_KEY_SHIFT = 1;
+static constexpr uint64_t PL_KEY_MASK = 0x7FFFFFFFULL; // 31 bits
+
+inline constexpr uint64_t pack_len(std::size_t key_len, std::size_t data_len) {
+    return (static_cast<uint64_t>(data_len) << PL_DATA_SHIFT) |
+           (static_cast<uint64_t>(key_len) << PL_KEY_SHIFT);
 }
 
-// Actual key length from the byte stored with the value at `val`.
-inline std::size_t key_len_at(const void* val) {
-    uint8_t n = 0;
-    std::memcpy(&n, static_cast<const unsigned char*>(val) - 1, 1);
-    return static_cast<std::size_t>(n) + MIN_KEY_BYTES;
+inline std::size_t packed_key_len(uint64_t packed) {
+    return static_cast<std::size_t>((packed & PL_KEY_MASK) >> PL_KEY_SHIFT);
 }
 
-// Pointer to the key bytes for the value at `val`.
-inline const unsigned char* key_ptr_at(const void* val) {
-    return static_cast<const unsigned char*>(val) - 1 - key_len_at(val);
+inline std::size_t packed_data_len(uint64_t packed) {
+    return static_cast<std::size_t>(packed >> PL_DATA_SHIFT);
+}
+
+inline bool packed_is_live(uint64_t packed) { return (packed & PL_DEAD) == 0; }
+
+inline uint64_t read_packed_len(const void* rec) {
+    uint64_t p;
+    std::memcpy(&p, rec, sizeof p);
+    return p;
+}
+
+// ptr is what find and iter hand out: the key, with the record header 8 bytes
+// before it and the value just past the key.
+inline std::size_t key_len_at(const void* ptr) {
+    return packed_key_len(read_packed_len(static_cast<const unsigned char*>(ptr) - PL_HEAD_BYTES));
+}
+
+inline const unsigned char* data_ptr_at(const void* ptr) {
+    return static_cast<const unsigned char*>(ptr) + key_len_at(ptr);
+}
+
+// Is the item a find or iter handed out still live? False once it is erased,
+// false for nullptr.
+inline bool ptr_is_live(const void* ptr) {
+    if (!ptr) return false;
+    uint64_t packed = 0;
+    std::memcpy(&packed, static_cast<const unsigned char*>(ptr) - PL_HEAD_BYTES,
+                sizeof packed);
+    return packed_is_live(packed);
+}
+
+// The key a find or iter pointer refers to.
+inline std::string_view read_key(const void* ptr) {
+    if (!ptr) return {};
+    return std::string_view(static_cast<const char*>(ptr), key_len_at(ptr));
+}
+
+// The value a find or iter pointer refers to.
+inline std::string_view read_str(const void* ptr) {
+    if (!ptr) return {};
+    uint64_t packed = 0;
+    std::memcpy(&packed, static_cast<const unsigned char*>(ptr) - PL_HEAD_BYTES,
+                sizeof packed);
+    return std::string_view(reinterpret_cast<const char*>(data_ptr_at(ptr)),
+                            packed_data_len(packed));
+}
+
+// The value a find or iter pointer refers to, copied out as a fixed-size type.
+// T{} if ptr is null. Same caveat as find_as: T has to be a type whose byte
+// image is the whole value.
+template <class T>
+inline T read_as(const void* ptr) {
+    if (!ptr) return T{};
+    T v{};
+    std::memcpy(&v, data_ptr_at(ptr), sizeof v);
+    return v;
 }
 
 // 8-bit fingerprint of a key: the filter that stands in for the key in a slot.
@@ -159,24 +204,19 @@ inline const unsigned char* key_ptr_at(const void* val) {
 //   [7..0]   the low byte, so a fingerprint there would agree exactly for keys
 //            that already share a home slot -- the one case the filter exists
 //            to reject.
-//   [63..56] the slot index is fast_map(hash, n1) -- the high bits of the
-//            128-bit product, which for a large n1 is the high end of the hash.
-//   the header of an entry is [57..56] state, [63..58] D_max; the fingerprint
+//   [63..56] the slot index is fast_map(hash, n1)
+//   The header of an entry is [57..56] state, [63..58] D_max; the fingerprint
 //   rides in [55..48] beside a 48-bit pointer, so its tag cannot reach [56..63].
-// Byte 1 shares no bit with any of those and needs no mix of its own, because
 // hash_key avalanches all 64 bits before this point.
 inline uint8_t fingerprint_of_hash(uint64_t h) {
     return static_cast<uint8_t>(h >> 8);
 }
 
-// Spans up to 8 bytes become one word and go straight through hash_key, so they
-// pay the finalizer only; longer spans go to std::hash<string_view> first and
-// are finalised after.
 inline uint64_t hash_bytes(const void* p, std::size_t len) {
     if (len == 8) {
         uint64_t w;
         std::memcpy(&w, p, 8);
-        return hash_key(w);           // plain integer key
+        return hash_key(w);
     }
     if (len < 8) {
         uint64_t w = 0;
@@ -195,9 +235,6 @@ inline uint8_t get_fingerprint(const Entry& e) {
     return static_cast<uint8_t>((e.word >> FP_SHIFT) & FP_MASK);
 }
 
-// Write an entry into a slot: fingerprint and pointer, with the given state,
-// preserving any existing D_max bound (an erased slot may still own elements
-// in T2). The key itself is not written here -- it is already in the record.
 inline bool write_slot(Entry& e, uint8_t fp, const void* val, uint8_t state) {
     uint64_t dmax = e.word & (DMAX_MASK << DMAX_SHIFT);
     e.word = encode_pointer(val) | (static_cast<uint64_t>(fp) << FP_SHIFT) | dmax |
@@ -214,20 +251,17 @@ inline void shift_entry(Entry& src, Entry& dst, uint8_t new_state) {
     src.word &= ~(STATE_MASK << STATE_SHIFT);
 }
 
-// Does `e` hold the probe span, at the already-computed fingerprint `fp`?
-//
-// Two forms, because the 8-byte case is the common one and knowing it at the
-// call site is worth a good deal: the `_8` form carries no length test and no
-// memcmp tail, so its body is a load and a compare that inlines straight into
-// the caller's probe sequence. The span form keeps the runtime test. Both must
-// agree on every input -- the length byte check below is the same in each.
+// The pointer in a slot is the record's key, so the key bytes sit right at it
+// and the header one load behind.
 inline bool slot_holds_fp_8(const Entry& e, const void* key, uint8_t fp) {
     if (get_state(e) == ST_EMPTY) return false;
     if (get_fingerprint(e) != fp) return false;
-    const auto* base = static_cast<const unsigned char*>(decode_pointer(e.word));
-    if (base[-1] != encode_key_len(8)) return false;
+    const auto* k = static_cast<const unsigned char*>(decode_pointer(e.word));
+    uint64_t packed;
+    std::memcpy(&packed, k - PL_HEAD_BYTES, sizeof packed);
+    if (packed_key_len(packed) != 8) return false;
     uint64_t a, b;
-    std::memcpy(&a, base - 9, 8);
+    std::memcpy(&a, k, 8);
     std::memcpy(&b, key, 8);
     return a == b;
 }
@@ -235,25 +269,39 @@ inline bool slot_holds_fp_8(const Entry& e, const void* key, uint8_t fp) {
 inline bool slot_holds_fp(const Entry& e, const void* key, std::size_t len, uint8_t fp) {
     if (get_state(e) == ST_EMPTY) return false;
     if (get_fingerprint(e) != fp) return false;
-    const auto* base = static_cast<const unsigned char*>(decode_pointer(e.word));
-    // A stored key shorter than the probe can hold the probe's bytes at val-9
-    // only by coincidence, so compare the stored length as well.
-    if (base[-1] != encode_key_len(len)) return false;
-    return std::memcmp(base - 1 - len, key, len) == 0;
+    const auto* k = static_cast<const unsigned char*>(decode_pointer(e.word));
+    // A stored key of another length can never equal the probe, so compare the
+    // stored length before touching the key bytes.
+    uint64_t packed;
+    std::memcpy(&packed, k - PL_HEAD_BYTES, sizeof packed);
+    if (packed_key_len(packed) != len) return false;
+    return std::memcmp(k, key, len) == 0;
 }
 
-// T2 counterpart of slot_holds_fp. A T2 tombstone keeps the erased key's
-// fingerprint and pointer, so the shared predicate would match it; a tombstone's
-// key is gone and must never read as live. T1 has no tombstones, so this check
-// lives here and not in slot_holds_fp.
+// A T2 tombstone keeps the erased key's fingerprint and pointer, so it would
+// match the shared predicate. EMPTY (0) and TOMBSTONE (1) are both dead, so one
+// compare against 2 rejects both.
 inline bool t2_holds_fp_8(const Entry& e, const void* key, uint8_t fp) {
-    if (get_state(e) == ST_TOMBSTONE) return false;
-    return slot_holds_fp_8(e, key, fp);
+    if (static_cast<uint8_t>(e.word >> STATE_SHIFT) < 2) return false;
+    if (get_fingerprint(e) != fp) return false;
+    const auto* k = static_cast<const unsigned char*>(decode_pointer(e.word));
+    uint64_t packed;
+    std::memcpy(&packed, k - PL_HEAD_BYTES, sizeof packed);
+    if (packed_key_len(packed) != 8) return false;
+    uint64_t a, b;
+    std::memcpy(&a, k, 8);
+    std::memcpy(&b, key, 8);
+    return a == b;
 }
 
 inline bool t2_holds_fp(const Entry& e, const void* key, std::size_t len, uint8_t fp) {
-    if (get_state(e) == ST_TOMBSTONE) return false;
-    return slot_holds_fp(e, key, len, fp);
+    if (static_cast<uint8_t>(e.word >> STATE_SHIFT) < 2) return false;
+    if (get_fingerprint(e) != fp) return false;
+    const auto* k = static_cast<const unsigned char*>(decode_pointer(e.word));
+    uint64_t packed;
+    std::memcpy(&packed, k - PL_HEAD_BYTES, sizeof packed);
+    if (packed_key_len(packed) != len) return false;
+    return std::memcmp(k, key, len) == 0;
 }
 
 // Default hash policy, and the shape a custom one takes:
@@ -266,7 +314,6 @@ inline bool t2_holds_fp(const Entry& e, const void* key, std::size_t len, uint8_
 // The span form is only called with len != 8 -- an 8-byte key is routed to the
 // 8-byte form first -- so its length-8 case is free to differ.
 //
-// The index is taken with a power-of-two mask, so the low bits must vary with
 // the key: a policy returning the key unchanged degenerates when they repeat.
 struct Hash {
     uint64_t operator()(const void* p, std::size_t len) const {
@@ -277,16 +324,14 @@ struct Hash {
     }
 };
 
-
 class KeyStore {
 public:
-    // `initial_bytes` is the size of the first arena block, in bytes: the store
-    // opens with that much and doubles on each later block. Zero or a value
-    // below one block selects the 4 KB default.
+    static std::size_t round_up_8(std::size_t n) {
+        return (n + 7) & ~static_cast<std::size_t>(7);
+    }
+
     explicit KeyStore(std::size_t initial_bytes) {
-        if (initial_bytes > kMinBlock) {
-            block_bytes_ = round_up_16(initial_bytes);
-        }
+        block_bytes_ = round_up_8(std::max(initial_bytes, kMinBlock));
         open_block(block_bytes_);
     }
 
@@ -295,117 +340,107 @@ public:
     KeyStore(const KeyStore&) = delete;
     KeyStore& operator=(const KeyStore&) = delete;
 
-    // Copy a key span and `bytes` into the store as one record and return a
-    // stable pointer to the value. The record is
-    //
-    //     [ key : len ][ len - MIN : 1 ][ value... ]
-    //
-    // padded to a whole number of 16-byte slots, so records sit at a fixed
-    // stride and four fill a cache line. A zero-length value still takes one
-    // slot. Returns nullptr for a key outside [MIN_KEY_BYTES, MAX_KEY_BYTES].
+    // Stores [header][key][data] and returns the address of the key -- the
+    // pointer the table keeps and find hands out.
     void* store(const void* key, std::size_t len, const void* bytes,
                 std::size_t bytes_len) {
-        if (len < MIN_KEY_BYTES || len > MAX_KEY_BYTES) return nullptr;
+        //  if (len == 0 || len > MAX_KEY_BYTES) return nullptr;   ??
 
-        std::size_t head = len + 1;                      // key bytes + length byte
-        std::size_t n = round_up_16(head + (bytes_len ? bytes_len : 1));
-        unsigned char* rec = reserve(n);
-
-        std::memcpy(rec, key, len);
-
-        unsigned char* lp = rec + len;
-        *lp = encode_key_len(len);
-
-        unsigned char* p = lp + 1;                       // value starts here
-        if (bytes_len) std::memcpy(p, bytes, bytes_len);
-        std::size_t written = head + bytes_len;
-        if (written < n) {
-            std::memset(rec + written, 0, n - written);
-        }
-        return p;
+        unsigned char* rec = reserve(round_up_8(PL_HEAD_BYTES + len + bytes_len));
+        const uint64_t packed = pack_len(len, bytes_len);
+        std::memcpy(rec, &packed, sizeof packed);
+        std::memcpy(rec + PL_HEAD_BYTES, key, len);
+        if (bytes_len) std::memcpy(rec + PL_HEAD_BYTES + len, bytes, bytes_len);
+        return rec + PL_HEAD_BYTES;
     }
 
-    // Same record, but the value is stored as [ len : size_t ][ bytes ], so a
-    // reader can recover the length from the pointer alone. One copy of the
-    // bytes, straight into the record -- no staging buffer.
-    void* store_str(const void* key, std::size_t len, const void* bytes,
-                    std::size_t bytes_len) {
-        if (len < MIN_KEY_BYTES || len > MAX_KEY_BYTES) return nullptr;
-
-        std::size_t head = len + 1;                      // key bytes + length byte
-        const std::size_t vlen = sizeof(std::size_t);
-        std::size_t n = round_up_16(head + vlen + (bytes_len ? bytes_len : 1));
-        unsigned char* rec = reserve(n);
-
-        std::memcpy(rec, key, len);
-
-        unsigned char* lp = rec + len;
-        *lp = encode_key_len(len);
-
-        unsigned char* p = lp + 1;                       // the value, length first
-        std::memcpy(p, &bytes_len, vlen);
-        if (bytes_len) std::memcpy(p + vlen, bytes, bytes_len);
-
-        std::size_t written = head + vlen + bytes_len;
-        if (written < n) {
-            std::memset(rec + written, 0, n - written);
-        }
-        return p;                                        // val-1 stays the key-length byte
+    // ptr is the key address store returned.
+    void mark_dead(void* ptr) {
+        unsigned char* rec = static_cast<unsigned char*>(ptr) - PL_HEAD_BYTES;
+        uint64_t packed = 0;
+        std::memcpy(&packed, rec, sizeof packed);
+        packed |= PL_DEAD;
+        std::memcpy(rec, &packed, sizeof packed);
     }
 
     void clear() {
         for (void* p : blocks_) std::free(p);
         blocks_.clear();
+        block_items_.clear();
         bump_ = nullptr;
         bump_left_ = 0;
         bytes_used_ = 0;
+        items_ = 0;
         block_bytes_ = kMinBlock;
     }
 
-    // Bytes currently held in allocated blocks (rounded to whole slots): the
-    // memory the store costs beyond the slot arrays.
     std::size_t bytes_used() const { return bytes_used_; }
 
 private:
-    // Round up to the next slot boundary; slots are 16 bytes.
-    static std::size_t round_up_16(std::size_t n) {
-        return (n + 15) & ~static_cast<std::size_t>(15);
-    }
-
-    // Allocate a fresh block of `bytes` and make it the bump region. Any space
-    // left in the old block is abandoned, but pointers into it stay valid.
     void open_block(std::size_t bytes) {
         void* raw = std::malloc(bytes);
         if (!raw) {
             std::fprintf(stderr, "mtht: out of memory in KeyStore\n");
             std::abort();
         }
+        if (!blocks_.empty()) block_items_.push_back(items_);
         blocks_.push_back(raw);
+        check_pointer_range(raw);
         bytes_used_ += bytes;
         bump_ = static_cast<unsigned char*>(raw);
         bump_left_ = bytes;
         block_bytes_ = bytes;
     }
 
-    // Reserve `bytes` of bump space and return it. Callers pass a whole number
-    // of slots, so the pointer and the remaining capacity stay slot-aligned.
     unsigned char* reserve(std::size_t bytes) {
         if (!bump_ || bytes > bump_left_) {
-            std::size_t block = bytes > block_bytes_ ? bytes : block_bytes_;
-            open_block(round_up_16(block));
+            open_block(std::max(bytes, block_bytes_));
         }
         unsigned char* p = bump_;
         bump_ += bytes;
         bump_left_ -= bytes;
+        ++items_;
         return p;
     }
 
+public:
+    std::size_t block_end(std::size_t block) const {
+        return block < block_items_.size() ? block_items_[block] : items_;
+    }
+
+    std::size_t items() const { return items_; }
+    std::size_t block_count() const { return blocks_.size(); }
+
+    const unsigned char* block_start(std::size_t block) const {
+        return static_cast<const unsigned char*>(blocks_[block]);
+    }
+
+    const unsigned char* next_record(const unsigned char* rec) const {
+        const uint64_t packed = read_packed_len(rec);
+        return rec + round_up_8(PL_HEAD_BYTES + packed_key_len(packed) + packed_data_len(packed));
+    }
+
+    const unsigned char* first_record() const {
+        return items_ == 0 ? nullptr : static_cast<const unsigned char*>(blocks_[0]);
+    }
+
+private:
     static constexpr std::size_t kMinBlock = 4096; // 256 slots
     unsigned char* bump_ = nullptr;
     std::size_t bump_left_ = 0;
     std::size_t bytes_used_ = 0;
     std::size_t block_bytes_ = kMinBlock; // doubles on each later block
+    std::size_t items_ = 0;
     std::vector<void*> blocks_;
+    std::vector<std::size_t> block_items_;
+};
+
+// A walk position, filled in by iter_start. The caller owns it: the table
+// keeps no reference, so copies of one are independent walks.
+struct IterState {
+    const unsigned char* rec = nullptr;
+    std::size_t block = 0;
+    std::size_t items = 0;
 };
 
 // The table. n1 (T1 slot count) and n2 (T2 slot count) are powers of two.
@@ -414,11 +449,6 @@ class BasicTable {
 public:
     static constexpr std::size_t DEFAULT_N1 = 1u << 20; // 1,048,576 slots, 16 MB
 
-    // n2 is the initial T2 size only: growth recomputes it as n1 >> SHIFT_RATIO,
-    // so n2 == 0 selects the default, which is also what every table settles on.
-    //
-    // store_bytes is the initial allocation size of the key store, in bytes;
-    // zero selects the 4 KB default.
     explicit BasicTable(std::size_t n1 = DEFAULT_N1, std::size_t store_bytes = 0)
         : key_store_(store_bytes) {
         if (n1 < 4) n1 = 4;
@@ -445,37 +475,35 @@ public:
     BasicTable(const BasicTable&) = delete;
     BasicTable& operator=(const BasicTable&) = delete;
 
-    std::size_t size() const { return count_; }
+    std::size_t size() const { return key_store_.items() - deleted_; }
     std::size_t n1() const { return n1_; }
     std::size_t n2() const { return n2_; }
-    std::size_t t1_count() const { return count_ - t2_count_; }
+    std::size_t t1_count() const { return size() - t2_count_; }
     std::size_t t2_count() const { return t2_count_; }
     double load1() const { return static_cast<double>(t1_count()) / static_cast<double>(n1_); }
     double load2() const { return static_cast<double>(t2_count_) / static_cast<double>(n2_); }
 
     std::size_t key_store_bytes() const { return key_store_.bytes_used(); }
 
-    // Raw slot arrays, for tests that verify the bit-level layout.
     const Entry* raw_t1() const { return t1_; }
     const Entry* raw_t2() const { return t2_; }
     Entry* raw_t1() { return t1_; }
     Entry* raw_t2() { return t2_; }
 
-    // Erase every element, keeping capacity.
     void clear() {
         std::memset(t1_, 0, n1_ * sizeof(Entry));
         std::memset(t2_, 0, n2_ * sizeof(Entry));
-        count_ = t2_count_ = 0;
+        t2_count_ = 0;
+        deleted_ = 0;
         key_store_.clear();
     }
 
-    // Re-inserting a key points the slot at a new record carrying the new
-    // value. The three overloads take an integer key, a string (through the
-    // string_view overload), or a raw key span; all reach insert_key().
-    // The key length is tested once, here, and the 8-byte case -- an integer
-    // key or an 8-byte string -- goes down a path that never tests it again.
     bool insert(uint64_t key, const void* bytes, std::size_t bytes_len) {
         return insert_key_8(&key, bytes, bytes_len);
+    }
+    // An int-int record: 8-byte key, 8-byte value.
+    bool insert(uint64_t key, uint64_t value) {
+        return insert_key_8(&key, &value, sizeof value);
     }
     bool insert(std::string_view key, const void* bytes, std::size_t bytes_len) {
         if (key.size() == 8) return insert_key_8(key.data(), bytes, bytes_len);
@@ -486,56 +514,35 @@ public:
         if (key_len == 8) return insert_key_8(key, bytes, bytes_len);
         return insert_key(key, key_len, bytes, bytes_len);
     }
-    // A string value: stored with its length in front, so find() can hand back
-    // a string rather than a bare pointer.
     bool insert(std::string_view key, const std::string& value) {
         if (key.size() == 8) return insert_key_8_str(key.data(), value);
         return insert_key_str(key.data(), key.size(), value);
     }
 
-    // The shared insert body: the key arrives as a span.
     bool insert_key(const void* key, std::size_t key_len, const void* bytes,
                     std::size_t bytes_len) {
-        void* val = key_store_.store(key, key_len, bytes, bytes_len);
-        if (!val) return false; // key outside [MIN_KEY_BYTES, MAX_KEY_BYTES]
+        void* rec = key_store_.store(key, key_len, bytes, bytes_len);
+        if (!rec) return false;
 
         const uint64_t hh = hash_(key, key_len);
-        return insert_place(key, key_len, hh, val, true);
+        return insert_place(key, key_len, hh, rec, true);
     }
-
-    // insert_key for an 8-byte key: identical except the placement probe uses
-    // the length-free predicate. Kept separate rather than folded in so the
-    // non-8 path keeps its single runtime test.
     bool insert_key_8(const void* key, const void* bytes, std::size_t bytes_len) {
-        void* val = key_store_.store(key, 8, bytes, bytes_len);
-        if (!val) return false;
+        void* rec = key_store_.store(key, 8, bytes, bytes_len);
+        if (!rec) return false;
 
         const uint64_t hh = hash_(key);
-        return insert_place_8(key, hh, val, true);
+        return insert_place_8(key, hh, rec, true);
     }
 
-    // String-value twins of insert_key / insert_key_8: same placement, but the
-    // record carries the value length.
     bool insert_key_str(const void* key, std::size_t key_len, const std::string& value) {
-        void* val = key_store_.store_str(key, key_len, value.data(), value.size());
-        if (!val) return false;
-
-        const uint64_t hh = hash_(key, key_len);
-        return insert_place(key, key_len, hh, val, true);
+        return insert_key(key, key_len, value.data(), value.size());
     }
 
     bool insert_key_8_str(const void* key, const std::string& value) {
-        void* val = key_store_.store_str(key, 8, value.data(), value.size());
-        if (!val) return false;
-
-        const uint64_t hh = hash_(key);
-        return insert_place_8(key, hh, val, true);
+        return insert_key_8(key, value.data(), value.size());
     }
 
-    // The live slot holding the key span, or nullptr -- the probe order find()
-    // uses. `h` is the key's home bucket and `fp` its fingerprint, both already
-    // computed by the caller. `in_t1` reports which table the hit came from, so
-    // erase() knows whether pull_neighbors_home applies.
     Entry* slot_for_key(const void* key, std::size_t key_len, uint64_t h, uint8_t fp,
                         bool& in_t1) {
         Entry& home = t1_[h];
@@ -557,9 +564,6 @@ public:
         return e;
     }
 
-    // T2 half of the probe set: the matching Entry, or nullptr. Mirrors
-    // find_in_T2's scans: backwards from the bound always, then -- only when the
-    // bound is saturated -- forwards from it, stopping at the first empty slot.
     Entry* slot_for_key_T2(uint64_t h, const void* key, std::size_t key_len, uint8_t fp,
                            uint8_t max_offset) {
         uint64_t base_t2 = (h >> SHIFT_RATIO) & mask2_;
@@ -578,7 +582,7 @@ public:
         return nullptr;
     }
 
-    // slot_for_key_T2 for an 8-byte key.
+    __attribute__((noinline))
     Entry* slot_for_key_T2_8(uint64_t h, const void* key, uint8_t fp, uint8_t max_offset) {
         uint64_t base_t2 = (h >> SHIFT_RATIO) & mask2_;
 
@@ -596,14 +600,6 @@ public:
         return nullptr;
     }
 
-    // Insert-or-place, one pass over {home, home+1, home-1}. The three states
-    // are read once here and serve both jobs: they decide whether an existing
-    // key occupies a slot (replace) and, failing that, which slot the new key
-    // takes. The old split -- slot_for_key's probe, then place_into's ladder
-    // re-reading the same three slots -- read each of them twice.
-    //
-    // `check_existing` is false on the grow path, where the freshly emptied
-    // table cannot hold a duplicate of the key being re-placed.
     bool insert_place(const void* key, std::size_t key_len, uint64_t hh, void* val,
                       bool check_existing) {
         const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
@@ -615,9 +611,6 @@ public:
         const uint8_t s_right = get_state(right);
         const uint8_t s_left = get_state(left);
 
-        // Replace an existing key. Same probe order as slot_for_key: home,
-        // then +1, then -1, then T2. Only the pointer changes; fingerprint,
-        // state and D_max bits survive.
         if (check_existing) {
             Entry* hit = nullptr;
             if (s_home == ST_OFF_ZERO && slot_holds_fp(home, key, key_len, fp)) {
@@ -631,28 +624,21 @@ public:
                 if (max_offset) hit = slot_for_key_T2(h, key, key_len, fp, max_offset);
             }
             if (hit) {
+                key_store_.mark_dead(decode_pointer(hit->word));
+                ++deleted_;
                 hit->word = (hit->word & ~PTR_MASK) | encode_pointer(val);
                 return true;
             }
         }
 
-        // Place the new key, reusing the states already read.
-        //
-        // 1. Direct placement in the home slot.
         if (s_home == ST_EMPTY) {
-            ++count_;
             return write_slot(home, fp, val, ST_OFF_ZERO);
         }
 
-        // 2. First free neighbor: the right one first, always. Reads probe +1
-        //    before -1, and the right shift below keeps displaced keys on that
-        //    side, so rightward placement is the one the probe finds soonest.
         if (s_right == ST_EMPTY) {
-            ++count_;
             return write_slot(right, fp, val, ST_OFF_POS);
         }
         if (s_left == ST_EMPTY) {
-            ++count_;
             return write_slot(left, fp, val, ST_OFF_NEG);
         }
 
@@ -661,15 +647,13 @@ public:
         //    at home+1 cannot move further out. The new key then takes h+1 at
         //    offset +1 -- the slot the probe checks first.
         //
-        //    Only an entry at offset 0 can be pushed: one already offset left
-        //    cannot be pushed further left. The far slot is therefore not
-        //    loaded unless the state test has passed.
+        //    Only an entry at offset 0 can be pushed: one offset left can't
+        //    be pushed left, and offset right means it was pushed by something at the left.
         if (s_right == ST_OFF_ZERO) {
             const uint64_t far_right = (h + 2) & mask1_;
             Entry& next_right = t1_[far_right];
             if (get_state(next_right) == ST_EMPTY) {
                 shift_entry(right, next_right, ST_OFF_POS);
-                ++count_;
                 return write_slot(right, fp, val, ST_OFF_POS);
             }
         }
@@ -680,17 +664,12 @@ public:
             Entry& next_left = t1_[far_left];
             if (get_state(next_left) == ST_EMPTY) {
                 shift_entry(left, next_left, ST_OFF_NEG);
-                ++count_;
                 return write_slot(left, fp, val, ST_OFF_NEG);
             }
         }
 
-        // 5. Neither neighbor can be cleared by a single shift: spill into T2.
-        //    No ripple -- one shift each way, then the spill.
         return insert_into_T2(hh, h, val);
     }
-
-    // insert_place for an 8-byte key: same body, length-free probes.
     bool insert_place_8(const void* key, uint64_t hh, void* val, bool check_existing) {
         const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
         const uint8_t fp = fingerprint_of_hash(hh);
@@ -714,21 +693,20 @@ public:
                 if (max_offset) hit = slot_for_key_T2_8(h, key, fp, max_offset);
             }
             if (hit) {
+                key_store_.mark_dead(decode_pointer(hit->word));
+                ++deleted_;
                 hit->word = (hit->word & ~PTR_MASK) | encode_pointer(val);
                 return true;
             }
         }
 
         if (s_home == ST_EMPTY) {
-            ++count_;
             return write_slot(home, fp, val, ST_OFF_ZERO);
         }
         if (s_right == ST_EMPTY) {
-            ++count_;
             return write_slot(right, fp, val, ST_OFF_POS);
         }
         if (s_left == ST_EMPTY) {
-            ++count_;
             return write_slot(left, fp, val, ST_OFF_NEG);
         }
         if (s_right == ST_OFF_ZERO) {
@@ -736,7 +714,6 @@ public:
             Entry& next_right = t1_[far_right];
             if (get_state(next_right) == ST_EMPTY) {
                 shift_entry(right, next_right, ST_OFF_POS);
-                ++count_;
                 return write_slot(right, fp, val, ST_OFF_POS);
             }
         }
@@ -745,15 +722,14 @@ public:
             Entry& next_left = t1_[far_left];
             if (get_state(next_left) == ST_EMPTY) {
                 shift_entry(left, next_left, ST_OFF_NEG);
-                ++count_;
                 return write_slot(left, fp, val, ST_OFF_NEG);
             }
         }
         return insert_into_T2(hh, h, val);
     }
 
-    // Returns the stored bytes for the key, or nullptr. Three key forms, as in
-    // insert().
+
+    // returns pointer to key; everything can be recovered from that
     void* find(uint64_t key) const { return find_key_8(&key); }
     void* find(std::string_view key) const {
         if (key.size() == 8) return find_key_8(key.data());
@@ -764,15 +740,30 @@ public:
         return find_key(key, key_len);
     }
 
-    // The string stored by insert(key, std::string), or empty if absent. The
-    // value's first sizeof(size_t) bytes are its length.
+    // returns data as string view
     std::string find_str(std::string_view key) const {
-        const void* p = find(key);
-        if (!p) return {};
-        std::size_t n = 0;
-        std::memcpy(&n, p, sizeof(std::size_t));
-        return std::string(static_cast<const char*>(p) + sizeof(std::size_t), n);
+        void* ptr = key.size() == 8 ? find_key_8(key.data())
+                                    : find_key(key.data(), key.size());
+        if (!ptr) return {};
+        const std::size_t n = packed_data_len(read_packed_len(
+            static_cast<const unsigned char*>(ptr) - PL_HEAD_BYTES));
+        return std::string(reinterpret_cast<const char*>(data_ptr_at(ptr)), n);
     }
+
+    // The value, copied out as a fixed-size type: T is read from the stored
+    // bytes, so it has to be a type whose byte image is the whole value
+    // (integers, floats, raw pointers, plain structs). T{} if the key is absent.
+    template <class T>
+    T find_as(std::string_view key) const {
+        const std::size_t n = key.size();
+        const void* p = n == 8 ? find_key_8(key.data()) : find_key(key.data(), n);
+        if (!p) return T{};
+        T v{};
+        std::memcpy(&v, data_ptr_at(p), sizeof v);
+        return v;
+    }
+
+
 
     void* find_key_8(const void* key) const {
         const uint64_t hh = hash_(key);
@@ -818,19 +809,10 @@ public:
         const uint8_t fp = fingerprint_of_hash(hh);
         const Entry& home = t1_[h];
 
-        // --- PROBE 1: home slot ---
         if (get_state(home) == ST_OFF_ZERO && slot_holds_fp(home, key, key_len, fp)) {
             return decode_pointer(home.word);
         }
 
-        // --- PROBE 2: the key's own neighbour ---
-        //
-        // A key's offset is confined to {-1, 0, +1} by construction, so when it
-        // is not in the home slot it is in exactly one neighbour -- never both,
-        // never a third.
-        //
-        // Probe order: +1 first -- the ripple shifts runs rightward, so a
-        // displaced key sits at h+1 more often than at h-1.
         const int first = +1;
         const Entry& n1 = t1_[(h + (uint64_t)first) & mask1_];
         if (slot_holds_fp(n1, key, key_len, fp)) {
@@ -841,20 +823,101 @@ public:
             return decode_pointer(n2.word);
         }
 
-        // --- spillover check: T2 ---
         uint8_t max_offset = get_t2_max_offset(home);
         if (max_offset == 0) return nullptr;
         return find_in_T2(h, key, key_len, fp, max_offset);
+    }
+
+    // ---- insertion-order iteration -------------------------------------
+
+    // Starts a walk and returns its state. The returned struct is the caller's:
+    // copy it to fork a walk, keep it as long as the walk runs. An empty table
+    // starts exhausted, so the first iter call returns nullptr.
+    IterState iter_start() const {
+        IterState state;
+        state.rec = key_store_.first_record();
+        return state;
+    }
+
+    // Advances a walk and returns the next live value pointer, or nullptr at
+    // the end. The state comes from iter_start; a state at the end stays at it.
+    void* iter(IterState& state) {
+        IterState& c = state;
+        while (c.rec) {
+            const unsigned char* rec = c.rec;
+            const uint64_t packed = read_packed_len(rec);
+
+            c.rec = key_store_.next_record(rec);
+            if (++c.items >= key_store_.block_end(c.block)) {
+                if (++c.block >= key_store_.block_count()) {
+                    c.rec = nullptr;
+                } else {
+                    c.rec = key_store_.block_start(c.block);
+                }
+            }
+
+            if (packed_is_live(packed)) {
+                return const_cast<unsigned char*>(rec) + PL_HEAD_BYTES; // the key
+            }
+        }
+        return nullptr;
+    }
+
+    // Calls f(key, value) for every live pair in insertion order. Both spans
+    // borrow from the table and are valid for the call; f must not insert or
+    // erase. The header is decoded once per record, not once per span.
+    //
+    // If f returns void, the walk is all it does. Otherwise it allocates R[n],
+    // where n is the live pair count known before the walk, and returns it as
+    // a unique_ptr<R[]> filled in insertion order. The caller owns the array.
+    template <class F>
+    auto map(F&& f) const {
+        using R = std::decay_t<std::invoke_result_t<F&, std::string_view,
+                                                    std::string_view>>;
+        if constexpr (std::is_void_v<R>) {
+            map_walk([&](std::string_view k, std::string_view v) { f(k, v); });
+        } else {
+            const std::size_t n = size();
+            std::unique_ptr<R[]> out(new R[n]);
+            R* p = out.get();
+            map_walk([&](std::string_view k, std::string_view v) {
+                *p++ = f(k, v);
+            });
+            return out;
+        }
+    }
+
+private:
+    // The walk map() runs, once per live pair, in insertion order.
+    template <class F>
+    void map_walk(F&& f) const {
+        IterState state = iter_start();
+        while (state.rec) {
+            const unsigned char* rec = state.rec;
+            const uint64_t packed = read_packed_len(rec);
+
+            state.rec = key_store_.next_record(rec);
+            if (++state.items >= key_store_.block_end(state.block)) {
+                if (++state.block >= key_store_.block_count()) {
+                    state.rec = nullptr;
+                } else {
+                    state.rec = key_store_.block_start(state.block);
+                }
+            }
+
+            if (!packed_is_live(packed)) continue;
+
+            const char* key = reinterpret_cast<const char*>(rec) + PL_HEAD_BYTES;
+            const std::size_t key_len = packed_key_len(packed);
+            f(std::string_view(key, key_len),
+              std::string_view(key + key_len, packed_data_len(packed)));
+        }
     }
 
     void* find_in_T2(uint64_t h, const void* key, std::size_t key_len, uint8_t fp,
                      uint8_t max_offset) const {
         uint64_t base_t2 = (h >> SHIFT_RATIO) & mask2_;
 
-        // Backwards from the bound, always. The stored bound is (furthest offset
-        // + 1), so the live spill is at or below max_offset - 1; empty and
-        // tombstoned slots below the bound are expected and skipped by the
-        // predicate.
         for (int off = static_cast<int>(max_offset) - 1; off >= 0; --off) {
             const Entry& e = t2_[(base_t2 + static_cast<uint64_t>(off)) & mask2_];
             if (t2_holds_fp(e, key, key_len, fp)) {
@@ -862,9 +925,6 @@ public:
             }
         }
 
-        // Saturated bound: the backwards scan has covered [0, max_offset), so
-        // the remaining spills live at or past it. Sweep forward from there,
-        // stopping at the first ST_EMPTY slot.
         if (max_offset == DMAX_SENTINEL) {
             for (uint64_t off = max_offset; off < n2_; ++off) {
                 const Entry& e = t2_[(base_t2 + off) & mask2_];
@@ -875,15 +935,12 @@ public:
         return nullptr;
     }
 
-    // Remove a key. A T1 slot clears to EMPTY but keeps its D_max (the home
-    // bucket may still own T2 spills); a T2 slot becomes a tombstone, so a
-    // forward T2 scan does not stop short of the live entries past it. Three
-    // key forms, as in insert(). Erase is not a hot path, so the 8-byte case
-    // runs the span path rather than a length-free copy.
+public:
     bool erase(uint64_t key) { return erase_key(&key, sizeof key); }
     bool erase(std::string_view key) { return erase_key(key.data(), key.size()); }
     bool erase(const void* key, std::size_t key_len) { return erase_key(key, key_len); }
 
+private:
     bool erase_key(const void* key, std::size_t key_len) {
         const uint64_t hh = hash_(key, key_len);
         const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
@@ -893,31 +950,29 @@ public:
         Entry* e = slot_for_key(key, key_len, h, fp, in_t1);
         if (!e) return false;
 
+        key_store_.mark_dead(decode_pointer(e->word));
+        ++deleted_;
         if (in_t1) {
-            e->word &= ~(STATE_MASK << STATE_SHIFT); // state -> EMPTY, D_max kept
+            e->word &= ~(STATE_MASK << STATE_SHIFT);
             pull_neighbors_home(static_cast<uint64_t>(e - t1_));
         } else {
             e->word &= ~(STATE_MASK << STATE_SHIFT);
             e->word |= static_cast<uint64_t>(ST_TOMBSTONE) << STATE_SHIFT;
             --t2_count_;
         }
-        --count_;
         return true;
     }
 
 private:
-    // Smallest power of two >= n, so slot indexing is `h & mask`. n <= 1
-    // returns 1; callers clamp to a floor first.
     static std::size_t ceil_pow2(std::size_t n) {
         std::size_t p = 1;
         while (p < n) p <<= 1;
         return p;
     }
 
-    // After `slot` frees, pull a key at `slot ± 1` whose own home is `slot`
-    // back into it. The freed gap can then travel one more step, bounded at
-    // two. The <= 2-probe bound in find() comes from insert confining offsets
-    // to {-1, 0, +1} -- this only keeps the displaced case rare under churn.
+    // After `slot` frees, pull in a key at `slot ± 1` whose own home is `slot`.
+    // The gap can travel two steps at most; find()'s 2-probe bound comes from
+    // insert confining offsets to {-1, 0, +1}.
     void pull_neighbors_home(uint64_t slot) {
         uint64_t gap = slot;
         for (int step = 0; step < 2; ++step) {
@@ -937,42 +992,33 @@ private:
     }
 
     bool insert_into_T2(uint64_t hh, uint64_t h, void* val) {
-        // Double the table when T2 reaches three quarters full, so the spill
-        // path below always has room.
         if (t2_count_ >= (n2_ >> 2) * 3) {
             if (!grow_to(n1_ * 2)) {
                 return false;
             }
-            h = fast_map(hh, static_cast<uint64_t>(n1_)); // n1_ changed with the growth
+            h = fast_map(hh, static_cast<uint64_t>(n1_));
         }
 
         uint64_t base_t2 = (h >> SHIFT_RATIO) & mask2_;
 
-        // First slot that is not a live entry -- ST_EMPTY or a tombstone --
-        // takes the spill.
         for (uint64_t off = 0; off < n2_; ++off) {
             uint64_t idx = (base_t2 + off) & mask2_;
             uint8_t st = get_state(t2_[idx]);
             if (st == ST_EMPTY || st == ST_TOMBSTONE) {
-                ++count_;
                 ++t2_count_;
 
-                // The bound is stored as (offset + 1), so offset 0 is
-                // distinguishable from "nothing spilled here".
+                // Stored as offset + 1, so offset 0 is not "nothing spilled".
                 const uint8_t dmax = std::min<uint8_t>(off + 1, DMAX_SENTINEL);
                 set_t2_max_offset(t1_[h], std::max(get_t2_max_offset(t1_[h]), dmax));
                 return write_slot(t2_[idx], fingerprint_of_hash(hh), val, ST_OFF_ZERO);
             }
         }
-        return false; // n2_ slots all live
+        return false;
     }
 
-    // Replace both slot arrays with larger ones and re-place every live entry
-    // through insert_place. T2-grown state does not need to carry over: the
-    // entries are re-placed from scratch against the new arrays.
     bool grow_to(std::size_t new_n1) {
         if (new_n1 <= n1_) return false;
-        new_n1 = ceil_pow2(new_n1); // mask = n1 - 1 requires a power of two
+        new_n1 = ceil_pow2(new_n1); // mask = n1 - 1 needs a power of two
         const std::size_t old_n1 = n1_, old_n2 = n2_;
         Entry* old_t1 = t1_;
         Entry* old_t2 = t2_;
@@ -983,7 +1029,7 @@ private:
         if (!new_t1 || !new_t2) {
             std::free(new_t1);
             std::free(new_t2);
-            return false; // table untouched
+            return false;
         }
 
         t1_ = new_t1;
@@ -992,17 +1038,16 @@ private:
         n2_ = new_n1 >> SHIFT_RATIO;
         mask1_ = n1_ - 1;
         mask2_ = n2_ - 1;
-        count_ = t2_count_ = 0;
+        t2_count_ = 0;
 
-        // T1 entries first, then T2: re-placing T1 while the table is still
-        // empty keeps its neighbourhoods sparse, so fewer entries spill. The
-        // new table holds no duplicates, so the replace probe is skipped.
+        // T1 first, then T2: re-placing T1 into an empty table keeps its
+        // neighbourhoods sparse, so fewer entries spill.
         for (std::size_t i = 0; i < old_n1; ++i) {
             const Entry& e = old_t1[i];
             if (get_state(e) == ST_EMPTY) continue;
             void* val = decode_pointer(e.word);
             std::size_t klen = key_len_at(val);
-            const void* k = key_ptr_at(val);
+            const void* k = val;
             const uint64_t hh = hash_(k, klen);
             insert_place(k, klen, hh, val, false);
         }
@@ -1012,7 +1057,7 @@ private:
             if (st == ST_EMPTY || st == ST_TOMBSTONE) continue;
             void* val = decode_pointer(e.word);
             std::size_t klen = key_len_at(val);
-            const void* k = key_ptr_at(val);
+            const void* k = val;
             const uint64_t hh = hash_(k, klen);
             insert_place(k, klen, hh, val, false);
         }
@@ -1028,7 +1073,7 @@ private:
     std::size_t n2_ = 0;
     std::size_t mask1_ = 0;
     std::size_t mask2_ = 0;
-    std::size_t count_ = 0;
+    std::size_t deleted_ = 0;
     std::size_t t2_count_ = 0;
     [[no_unique_address]] Hash hash_{};
     KeyStore key_store_;

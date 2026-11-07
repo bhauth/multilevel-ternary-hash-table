@@ -110,7 +110,7 @@ static Row run_mtht(const StringKeys& keys, std::size_t valbytes, std::size_t /*
         hit = 0;
         for (const std::string& k : keys) {
             const void* p = t.find(k.data(), k.size());
-            if (p) { sink += *(const unsigned char*)p; ++hit; }
+            if (p) { sink += *(const unsigned char*)mtht::read_str(p).data(); ++hit; }
         }
         const double d = ms_since(t0);
         if (d < best) best = d;
@@ -260,7 +260,7 @@ static void cell_str8(std::size_t valbytes, std::size_t nkeys) {
             auto t0 = Clock::now(); hit = 0;
             for (const std::string& k : keys) {
                 const void* p = t.find(k.data(), k.size());
-                if (p) { sink += *(const unsigned char*)p; ++hit; }
+                if (p) { sink += *(const unsigned char*)mtht::read_str(p).data(); ++hit; }
             }
             best = std::min(best, ms_since(t0));
         }
@@ -425,7 +425,7 @@ static void cell_realistic(std::size_t nkeys) {
             auto t0 = Clock::now(); hit = 0;
             for (const std::string& k : keys) {
                 const void* p = t.find(k.data(), k.size());
-                if (p) { sink += *(const unsigned char*)p; ++hit; }
+                if (p) { sink += *(const unsigned char*)mtht::read_str(p).data(); ++hit; }
             }
             best = std::min(best, ms_since(t0));
         }

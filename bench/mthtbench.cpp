@@ -282,7 +282,7 @@ static Invariant check_invariant(mtht::Table& t) {
         if (st == mtht::ST_EMPTY) continue;
         ++r.live;
         const uint64_t h = mtht::fast_map(
-            mtht::hash_bytes(mtht::key_ptr_at(mtht::decode_pointer(e.word)),
+            mtht::hash_bytes(mtht::decode_pointer(e.word),
                              mtht::key_len_at(mtht::decode_pointer(e.word))),
             static_cast<uint64_t>(t.n1()));
         // Distance from home, wrapping.
@@ -331,7 +331,7 @@ static bool suite_correctness(std::size_t n1_shift, std::size_t t2_div,
             const void* p = t.find(k);
             if (!p) continue;
             ++found;
-            if (*static_cast<const uint64_t*>(p) != k) ++wrong_val;
+            if (*reinterpret_cast<const uint64_t*>(mtht::read_str(p).data()) != k) ++wrong_val;
         }
         const Keys absent = gen_absent(nkeys, 0xFACEULL);
         std::size_t false_pos = 0;
@@ -393,7 +393,7 @@ static void suite_mtht(std::size_t n1_shift, std::size_t t2_div, std::size_t ins
             auto t1 = Clock::now();
             for (uint64_t k : d.keys) {
                 const void* p = t.find(k);
-                if (p) sink += *static_cast<const uint64_t*>(p);
+                if (p) sink += *reinterpret_cast<const uint64_t*>(mtht::read_str(p).data());
             }
             const double dd = ms_since(t1);
             if (dd < best) best = dd;
@@ -468,7 +468,7 @@ static void suite_mtht_loads(std::size_t n1_shift, std::size_t t2_div,
             auto t0 = Clock::now();
             for (std::size_t i = 0; i < nhave; ++i) {
                 const void* p = t.find(d.keys[i]);
-                if (p) sink += *static_cast<const uint64_t*>(p);
+                if (p) sink += *reinterpret_cast<const uint64_t*>(mtht::read_str(p).data());
             }
             const double dd = ms_since(t0);
             if (dd < best) best = dd;
@@ -537,7 +537,7 @@ static PeerResult time_mtht(const Keys& keys, std::size_t N1, std::size_t N2, ui
         auto t0 = Clock::now();
         for (uint64_t k : keys) {
             const void* p = t.find(k);
-            if (p) sink += **static_cast<const uint64_t* const*>(p);
+            if (p) sink += *reinterpret_cast<const uint64_t*>(mtht::read_str(p).data());
         }
         const double d = ms_since(t0);
         if (d < best) best = d;
@@ -746,7 +746,7 @@ static PeerResult time_mtht_strings(const StringKeys& keys, std::size_t N1, std:
         auto t0 = Clock::now();
         for (const std::string& k : keys) {
             const void* p = t.find(k.data(), k.size());
-            if (p) sink += **static_cast<const uint64_t* const*>(p);
+            if (p) sink += *reinterpret_cast<const uint64_t*>(mtht::read_str(p).data());
         }
         const double d = ms_since(t0);
         if (d < best) best = d;
@@ -758,7 +758,8 @@ static PeerResult time_mtht_strings(const StringKeys& keys, std::size_t N1, std:
     std::size_t found_ok = 0;
     for (const std::string& k : keys) {
         const void* p = t.find(k.data(), k.size());
-        if (p && *(const uint64_t* const*)p == pv) ++found_ok;
+        if (p && *reinterpret_cast<const uint64_t* const*>(mtht::read_str(p).data()) == pv)
+            ++found_ok;
     }
     if (ins_ok != keys.size())
         out::line("  !! MTHT(strings): %zu/%zu inserts accepted", ins_ok, keys.size());
