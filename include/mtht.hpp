@@ -395,6 +395,14 @@ public:
         return block < block_items_.size() ? block_items_[block] : items_;
     }
 
+    // Records in a block. block_items_ holds each closed block's cumulative
+    // item count, so a block's own size is the step from the previous one.
+    std::size_t block_size(std::size_t block) const {
+        const std::size_t end = block < block_items_.size() ? block_items_[block] : items_;
+        const std::size_t begin = block == 0 ? 0 : block_items_[block - 1];
+        return end - begin;
+    }
+
     std::size_t items() const { return items_; }
     std::size_t block_count() const { return blocks_.size(); }
 
@@ -829,13 +837,12 @@ public:
             const unsigned char* rec = c.rec;
             const uint64_t packed = read_packed_len(rec);
 
-            c.rec = key_store_.next_record(rec);
-            if (++c.items >= key_store_.block_end(c.block)) {
-                if (++c.block >= key_store_.block_count()) {
-                    c.rec = nullptr;
-                } else {
-                    c.rec = key_store_.block_start(c.block);
-                }
+            if (++c.items < key_store_.block_end(c.block)) {
+                c.rec = key_store_.next_record(rec);
+            } else if (++c.block >= key_store_.block_count()) {
+                c.rec = nullptr;
+            } else {
+                c.rec = key_store_.block_start(c.block);
             }
 
             if (packed_is_live(packed)) {
@@ -870,30 +877,33 @@ public:
     }
 
 private:
-    // The walk map() runs, once per live pair, in insertion order.
+    // The walk map() runs, once per live pair, in insertion order. It tracks
+    // its own cursor, so the loop state stays in registers.
     template <class F>
     void map_walk(F&& f) const {
-        IterState state = iter_start();
-        while (state.rec) {
-            const unsigned char* rec = state.rec;
-            const uint64_t packed = read_packed_len(rec);
+        std::size_t block = 0;
+        const unsigned char* rec = key_store_.first_record();
+        std::size_t left = key_store_.block_size(0);
 
-            state.rec = key_store_.next_record(rec);
-            if (++state.items >= key_store_.block_end(state.block)) {
-                if (++state.block >= key_store_.block_count()) {
-                    state.rec = nullptr;
-                } else {
-                    state.rec = key_store_.block_start(state.block);
-                }
-            }
-
-            if (!packed_is_live(packed)) continue;
-
-            const char* key = reinterpret_cast<const char*>(rec) + PL_HEAD_BYTES;
+    walk:
+        while (left != 0) {
+            const unsigned char* cur = rec;
+            const uint64_t packed = read_packed_len(cur);
             const std::size_t key_len = packed_key_len(packed);
-            f(std::string_view(key, key_len),
-              std::string_view(key + key_len, packed_data_len(packed)));
+            const std::size_t data_len = packed_data_len(packed);
+            rec = cur + KeyStore::round_up_8(PL_HEAD_BYTES + key_len + data_len);
+            --left;
+            if (packed_is_live(packed)) {
+                const char* key = reinterpret_cast<const char*>(cur) + PL_HEAD_BYTES;
+                f(std::string_view(key, key_len),
+                  std::string_view(key + key_len, data_len));
+            }
         }
+
+        if (++block == key_store_.block_count()) return;
+        rec = key_store_.block_start(block);
+        left = key_store_.block_size(block);
+        goto walk;
     }
 
     void* find_in_T2(uint64_t h, const void* key, std::size_t key_len, uint8_t fp,
