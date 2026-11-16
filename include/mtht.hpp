@@ -242,17 +242,14 @@ inline void shift_entry(Entry& src, Entry& dst, uint8_t new_state) {
 
 // The pointer in a slot is the record's key, so the key bytes sit right at it
 // and the header one load behind.
-inline bool slot_holds_fp_8(const Entry& e, const void* key, uint8_t fp) {
+inline bool slot_holds_fp_8(const Entry& e, uint64_t key_val, uint8_t fp) {
     if (get_state(e) == ST_EMPTY) return false;
     if (get_fingerprint(e) != fp) return false;
     const auto* k = static_cast<const unsigned char*>(decode_pointer(e.word));
     uint64_t packed;
     std::memcpy(&packed, k - PL_HEAD_BYTES, sizeof packed);
     if (packed_key_len(packed) != 8) return false;
-    uint64_t a, b;
-    std::memcpy(&a, k, 8);
-    std::memcpy(&b, key, 8);
-    return a == b;
+    return read_word(k) == key_val;
 }
 
 inline bool slot_holds_fp(const Entry& e, const void* key, std::size_t len, uint8_t fp) {
@@ -270,17 +267,14 @@ inline bool slot_holds_fp(const Entry& e, const void* key, std::size_t len, uint
 // A T2 tombstone keeps the erased key's fingerprint and pointer, so it would
 // match the shared predicate. EMPTY (0) and TOMBSTONE (1) are both dead, so one
 // compare against 2 rejects both.
-inline bool t2_holds_fp_8(const Entry& e, const void* key, uint8_t fp) {
+inline bool t2_holds_fp_8(const Entry& e, uint64_t key_val, uint8_t fp) {
     if (static_cast<uint8_t>(e.word >> STATE_SHIFT) < 2) return false;
     if (get_fingerprint(e) != fp) return false;
     const auto* k = static_cast<const unsigned char*>(decode_pointer(e.word));
     uint64_t packed;
     std::memcpy(&packed, k - PL_HEAD_BYTES, sizeof packed);
     if (packed_key_len(packed) != 8) return false;
-    uint64_t a, b;
-    std::memcpy(&a, k, 8);
-    std::memcpy(&b, key, 8);
-    return a == b;
+    return read_word(k) == key_val;
 }
 
 inline bool t2_holds_fp(const Entry& e, const void* key, std::size_t len, uint8_t fp) {
@@ -518,11 +512,13 @@ public:
         return insert_place(key, key_len, hh, rec, true);
     }
     bool insert_key_8(const void* key, const void* bytes, std::size_t bytes_len) {
+        const uint64_t hh = hash_(key);
+        const uint64_t key_val = read_word(key);
+
         void* rec = key_store_.store(key, 8, bytes, bytes_len);
         if (!rec) return false;
 
-        const uint64_t hh = hash_(key);
-        return insert_place_8(key, hh, rec, true);
+        return insert_place_8(key_val, hh, rec, true);
     }
 
     bool insert_key_str(const void* key, std::size_t key_len, const std::string& value) {
@@ -573,18 +569,18 @@ public:
     }
 
     __attribute__((noinline))
-    Entry* slot_for_key_T2_8(uint64_t h, const void* key, uint8_t fp, uint8_t max_offset) {
+    Entry* slot_for_key_T2_8(uint64_t h, uint64_t key_val, uint8_t fp, uint8_t max_offset) {
         uint64_t base_t2 = (h >> SHIFT_RATIO) & mask2_;
 
         for (int off = static_cast<int>(max_offset) - 1; off >= 0; --off) {
             Entry& e = t2_[(base_t2 + static_cast<uint64_t>(off)) & mask2_];
-            if (t2_holds_fp_8(e, key, fp)) return &e;
+            if (t2_holds_fp_8(e, key_val, fp)) return &e;
         }
         if (max_offset == DMAX_SENTINEL) {
             for (uint64_t off = max_offset; off < n2_; ++off) {
                 Entry& e = t2_[(base_t2 + off) & mask2_];
                 if (get_state(e) == ST_EMPTY) break;
-                if (t2_holds_fp_8(e, key, fp)) return &e;
+                if (t2_holds_fp_8(e, key_val, fp)) return &e;
             }
         }
         return nullptr;
@@ -660,7 +656,7 @@ public:
 
         return insert_into_T2(hh, h, val);
     }
-    bool insert_place_8(const void* key, uint64_t hh, void* val, bool check_existing) {
+    bool insert_place_8(uint64_t key_val, uint64_t hh, void* val, bool check_existing) {
         const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
         const uint8_t fp = fingerprint_of_hash(hh);
         Entry& home = t1_[h];
@@ -672,15 +668,15 @@ public:
 
         if (check_existing) {
             Entry* hit = nullptr;
-            if (s_home == ST_OFF_ZERO && slot_holds_fp_8(home, key, fp)) {
+            if (s_home == ST_OFF_ZERO && slot_holds_fp_8(home, key_val, fp)) {
                 hit = &home;
-            } else if (slot_holds_fp_8(right, key, fp)) {
+            } else if (slot_holds_fp_8(right, key_val, fp)) {
                 hit = &right;
-            } else if (slot_holds_fp_8(left, key, fp)) {
+            } else if (slot_holds_fp_8(left, key_val, fp)) {
                 hit = &left;
             } else {
                 const uint8_t max_offset = get_t2_max_offset(home);
-                if (max_offset) hit = slot_for_key_T2_8(h, key, fp, max_offset);
+                if (max_offset) hit = slot_for_key_T2_8(h, key_val, fp, max_offset);
             }
             if (hit) {
                 key_store_.mark_dead(decode_pointer(hit->word));
@@ -720,7 +716,7 @@ public:
 
 
     // returns pointer to key; everything can be recovered from that
-    void* find(uint64_t key) const { return find_key_8(&key); }
+    void* find(uint64_t key) const { return find_key_8_val(key); }
     void* find(std::string_view key) const {
         if (key.size() == 8) return find_key_8(key.data());
         return find_key(key.data(), key.size());
@@ -756,38 +752,43 @@ public:
 
 
     void* find_key_8(const void* key) const {
-        const uint64_t hh = hash_(key);
+        return find_key_8_val(read_word(key));
+    }
+
+    void* find_key_8_val(uint64_t key_val) const {
+        const uint64_t hh = hash_key(key_val);
         const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
         const uint8_t fp = fingerprint_of_hash(hh);
         const Entry& home = t1_[h];
 
-        if (get_state(home) == ST_OFF_ZERO && slot_holds_fp_8(home, key, fp)) {
+        if (get_state(home) == ST_OFF_ZERO && slot_holds_fp_8(home, key_val, fp)) {
             return decode_pointer(home.word);
         }
 
         const int first = +1;
         const Entry& n1 = t1_[(h + (uint64_t)first) & mask1_];
-        if (slot_holds_fp_8(n1, key, fp)) return decode_pointer(n1.word);
+        if (slot_holds_fp_8(n1, key_val, fp)) return decode_pointer(n1.word);
         const Entry& n2 = t1_[(h + (uint64_t)-first) & mask1_];
-        if (slot_holds_fp_8(n2, key, fp)) return decode_pointer(n2.word);
+        if (slot_holds_fp_8(n2, key_val, fp)) return decode_pointer(n2.word);
 
         uint8_t max_offset = get_t2_max_offset(home);
         if (max_offset == 0) return nullptr;
-        return find_in_T2_8(h, key, fp, max_offset);
+        return find_in_T2_8(h, key_val, fp, max_offset);
     }
 
-    void* find_in_T2_8(uint64_t h, const void* key, uint8_t fp, uint8_t max_offset) const {
+    __attribute__((noinline))
+    void* find_in_T2_8(uint64_t h, uint64_t key_val, uint8_t fp, uint8_t max_offset) const {
         uint64_t base_t2 = (h >> SHIFT_RATIO) & mask2_;
 
         for (int off = static_cast<int>(max_offset) - 1; off >= 0; --off) {
             const Entry& e = t2_[(base_t2 + static_cast<uint64_t>(off)) & mask2_];
-            if (t2_holds_fp_8(e, key, fp)) return decode_pointer(e.word);
+            if (t2_holds_fp_8(e, key_val, fp)) return decode_pointer(e.word);
         }
         if (max_offset == DMAX_SENTINEL) {
             for (uint64_t off = max_offset; off < n2_; ++off) {
                 const Entry& e = t2_[(base_t2 + off) & mask2_];
                 if (get_state(e) == ST_EMPTY) break;
-                if (t2_holds_fp_8(e, key, fp)) return decode_pointer(e.word);
+                if (t2_holds_fp_8(e, key_val, fp)) return decode_pointer(e.word);
             }
         }
         return nullptr;
