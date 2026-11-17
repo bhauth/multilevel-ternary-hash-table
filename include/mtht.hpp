@@ -444,22 +444,18 @@ public:
         n1 = ceil_pow2(n1);
         n2_ = n1 >> SHIFT_RATIO;
         if (n2_ < 4) n2_ = 4;
-        n2_ = ceil_pow2(n2_);
         n1_ = n1;
         mask1_ = n1 - 1;
         mask2_ = n2_ - 1;
-        t1_ = static_cast<Entry*>(std::calloc(n1, sizeof(Entry)));
-        t2_ = static_cast<Entry*>(std::calloc(n2_, sizeof(Entry)));
-        if (!t1_ || !t2_) {
+        t1_ = static_cast<Entry*>(std::calloc(n1 + n2_, sizeof(Entry)));
+        if (!t1_) {
             std::fprintf(stderr, "mtht: out of memory for tables\n");
             std::abort();
         }
+        t2_ = t1_ + n1_;
     }
 
-    ~BasicTable() {
-        std::free(t1_);
-        std::free(t2_);
-    }
+    ~BasicTable() { std::free(t1_); }
 
     BasicTable(const BasicTable&) = delete;
     BasicTable& operator=(const BasicTable&) = delete;
@@ -475,8 +471,7 @@ public:
     std::size_t key_store_bytes() const { return key_store_.bytes_used(); }
 
     void clear() {
-        std::memset(t1_, 0, n1_ * sizeof(Entry));
-        std::memset(t2_, 0, n2_ * sizeof(Entry));
+        std::memset(t1_, 0, (n1_ + n2_) * sizeof(Entry));
         t2_count_ = 0;
         deleted_ = 0;
         key_store_.clear();
@@ -1014,21 +1009,15 @@ private:
         new_n1 = ceil_pow2(new_n1); // mask = n1 - 1 needs a power of two
         const std::size_t old_n1 = n1_, old_n2 = n2_;
         Entry* old_t1 = t1_;
-        Entry* old_t2 = t2_;
 
-        Entry* new_t1 = static_cast<Entry*>(std::calloc(new_n1, sizeof(Entry)));
-        Entry* new_t2 =
-            static_cast<Entry*>(std::calloc(new_n1 >> SHIFT_RATIO, sizeof(Entry)));
-        if (!new_t1 || !new_t2) {
-            std::free(new_t1);
-            std::free(new_t2);
-            return false;
-        }
+        const std::size_t new_n2 = new_n1 >> SHIFT_RATIO;
+        Entry* new_t1 = static_cast<Entry*>(std::calloc(new_n1 + new_n2, sizeof(Entry)));
+        if (!new_t1) return false;
 
         t1_ = new_t1;
-        t2_ = new_t2;
+        t2_ = new_t1 + new_n1;
         n1_ = new_n1;
-        n2_ = new_n1 >> SHIFT_RATIO;
+        n2_ = new_n2;
         mask1_ = n1_ - 1;
         mask2_ = n2_ - 1;
         t2_count_ = 0;
@@ -1044,6 +1033,7 @@ private:
             const uint64_t hh = hash_(k, klen);
             insert_place(k, klen, hh, val, false);
         }
+        const Entry* old_t2 = old_t1 + old_n1;
         for (std::size_t i = 0; i < old_n2; ++i) {
             const Entry& e = old_t2[i];
             uint8_t st = get_state(e);
@@ -1056,7 +1046,6 @@ private:
         }
 
         std::free(old_t1);
-        std::free(old_t2);
         return true;
     }
 
