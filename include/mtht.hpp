@@ -344,6 +344,15 @@ public:
         std::memcpy(rec, &packed, sizeof packed);
     }
 
+    // Undoes mark_dead. ptr is the key address store returned.
+    void mark_live(void* ptr) {
+        unsigned char* rec = static_cast<unsigned char*>(ptr) - PL_HEAD_BYTES;
+        uint64_t packed = 0;
+        std::memcpy(&packed, rec, sizeof packed);
+        packed &= ~PL_DEAD;
+        std::memcpy(rec, &packed, sizeof packed);
+    }
+
     void clear() {
         for (void* p : blocks_) std::free(p);
         blocks_.clear();
@@ -848,6 +857,52 @@ public:
         return nullptr;
     }
 
+    // Advances a walk and returns the next pair in the order its key was first
+    // stored, or nullptr at the end. Slower than iter(): a tombstoned record
+    // costs a lookup, so a key erased and put back is yielded where it first
+    // appeared rather than where it was put back.
+    //
+    // A tombstone's key still reads back, so it can be looked up. The live
+    // record that lookup finds is this key's first appearance: it is yielded
+    // here, at the tombstone's position, and marked dead. Reaching it later,
+    // the walk sees it dead, finds itself, marks it live again and yields
+    // nothing -- so the pair is visited once, where it belongs.
+    void* iter_first(IterState& state) {
+        IterState& c = state;
+        while (c.rec) {
+            const unsigned char* rec = c.rec;
+            const uint64_t packed = read_packed_len(rec);
+
+            if (++c.items < key_store_.block_end(c.block)) {
+                c.rec = key_store_.next_record(rec);
+            } else if (++c.block >= key_store_.block_count()) {
+                c.rec = nullptr;
+            } else {
+                c.rec = key_store_.block_start(c.block);
+            }
+
+            if (packed_is_live(packed)) {
+                return const_cast<unsigned char*>(rec) + PL_HEAD_BYTES;
+            }
+
+            // Dead: look the key up and act on what is found.
+            unsigned char* const key = const_cast<unsigned char*>(rec) + PL_HEAD_BYTES;
+            void* const found = find(key, packed_key_len(packed));
+            if (!found) continue;
+
+            const unsigned char* const found_rec =
+                static_cast<const unsigned char*>(found) - PL_HEAD_BYTES;
+            if (packed_is_live(read_packed_len(found_rec))) {
+                key_store_.mark_dead(found); // first appearance, served here
+                return found;
+            }
+            // Dead already. If it is this record, an earlier tombstone served
+            // its position, so put the bit back.
+            if (found == key) key_store_.mark_live(found);
+        }
+        return nullptr;
+    }
+
     // Calls f(key, value) for every live pair in insertion order. Both spans
     // borrow from the table and are valid for the call; f must not insert or
     // erase. The header is decoded once per record, not once per span.
@@ -873,8 +928,7 @@ public:
     }
 
 private:
-    // The walk map() runs, once per live pair, in insertion order. It tracks
-    // its own cursor, so the loop state stays in registers.
+    // The walk map() runs, once per live pair, in insertion order.
     template <class F>
     void map_walk(F&& f) const {
         std::size_t block = 0;

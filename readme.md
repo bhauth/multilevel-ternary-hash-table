@@ -107,10 +107,18 @@ table.erase(key, key_len);
 void* held = table.find(key, key_len);
 if (mtht::ptr_is_live(held)) { /* value still valid */ }
 
-// iterate every live entry, in insertion order
+// iterate every live entry, in order of latest insertion
 auto cur = table.iter_start();
 while (void* entry = table.iter(cur)) {
     // iter gives the same item pointers as find()
+    std::string_view k = mtht::read_key(entry);
+    std::string_view v = mtht::read_str(entry);
+}
+
+// iterate in the order each key was first stored
+// overwritten elements will require lookups and make this slower
+auto first = table.iter_start();
+while (void* entry = table.iter_first(first)) {
     std::string_view k = mtht::read_key(entry);
     std::string_view v = mtht::read_str(entry);
 }
