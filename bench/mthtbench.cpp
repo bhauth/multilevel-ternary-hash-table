@@ -18,6 +18,8 @@
 //                           it auto-resizes (time vs achieved load)
 //     --suite=peers         MTHT vs other maps on random keys (time, bytes/key)
 //     --suite=strings       MTHT (string keys) vs string-keyed maps (time, B/key)
+//     --suite=iterate       MTHT iter() vs each peer's range-for over every pair
+//                           (visits/s), string keys and values at the same load
 //
 //   Other flags:
 //     --peers=NAME,...      peer columns for --suite=peers and --suite=strings
@@ -257,8 +259,33 @@ static StringKeys gen_strings(std::size_t n, uint64_t seed) {
     return v;
 }
 
-struct Dist { const char* name; Keys keys; };
+// Values for the iteration bench: same banded length distribution as the keys,
+// so a visit pays for a real string payload, not a pointer chase into one.
+static StringKeys gen_values(std::size_t n, uint64_t seed) {
+    static const char alnum[] =
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    StringKeys v;
+    v.reserve(n);
+    uint64_t s = seed;
+    for (std::size_t i = 0; i < n; ++i) {
+        s = splitmix(s);
+        const uint64_t r = s;
+        std::size_t len;
+        if ((r % 100) < 60)      len = 1 + (r >> 8) % 12;
+        else if ((r % 100) < 92) len = 13 + (r >> 8) % 36;
+        else                     len = 49 + (r >> 8) % 176;
+        std::string str;
+        str.resize(len);
+        for (std::size_t j = 0; j < len; ++j) {
+            s = splitmix(s);
+            str[j] = alnum[s % (sizeof(alnum) - 1)];
+        }
+        v.push_back(std::move(str));
+    }
+    return v;
+}
 
+struct Dist { const char* name; Keys keys; };
 static std::vector<Dist> distributions(std::size_t n) {
     return {{"sequential", gen_sequential(n)},
             {"random", gen_random(n, 0x12345678ULL)},
@@ -943,6 +970,117 @@ static void suite_peers_strings(std::size_t n1_shift, std::size_t t2_div, std::s
     out::line("");
 }
 
+// Iteration: the table's own iter() loop against each peer's range-for. Both walk
+// the whole table once per live pair, so the numbers are visits/s, not reads/s.
+struct IterResult { double kps; std::size_t n; };
+
+static IterResult time_mtht_iter(const StringKeys& keys, const StringKeys& vals,
+                                std::size_t N1) {
+    volatile uint64_t sink = 0;
+    mtht::Table t(N1, sizeof(uint64_t));
+    for (std::size_t i = 0; i < keys.size(); ++i)
+        t.insert(keys[i].data(), keys[i].size(), vals[i].data(), vals[i].size());
+
+    double best = 1e18;
+    for (int r = 0; r < 7; ++r) {
+        auto t0 = Clock::now();
+        mtht::IterState st = t.iter_start();
+        while (const void* p = t.iter(st)) {
+            const std::string_view v = mtht::read_str(p);
+            sink += mtht::key_len_at(p) + std::size_t(v.size()) + (unsigned char)v[0];
+        }
+        const double d = ms_since(t0);
+        if (d < best) best = d;
+    }
+    (void)sink;
+    return { (double)t.size() / best, t.size() };
+}
+
+static IterResult time_robin_iter(const StringKeys& keys, const StringKeys& vals,
+                                  std::size_t, float target_load) {
+#if HAVE_ROBIN
+    tsl::robin_map<std::string, std::string, str_mtht_hash> rm;
+    rm.max_load_factor(target_load > 0.0f ? target_load : 0.75f);
+    rm.reserve(keys.size());
+    for (std::size_t i = 0; i < keys.size(); ++i) rm.insert({keys[i], vals[i]});
+
+    volatile uint64_t sink = 0;
+    double best = 1e18;
+    for (int r = 0; r < 7; ++r) {
+        auto t0 = Clock::now();
+        for (const auto& kv : rm)
+            sink += kv.first.size() + kv.second.size() + (unsigned char)kv.second[0];
+        const double d = ms_since(t0);
+        if (d < best) best = d;
+    }
+    (void)sink;
+    return { (double)rm.size() / best, rm.size() };
+#else
+    (void)keys; (void)vals; (void)target_load;
+    return { 0.0, 0 };
+#endif
+}
+
+static IterResult time_udense_iter(const StringKeys& keys, const StringKeys& vals,
+                                   std::size_t, float target_load) {
+#if HAVE_UDENSE
+    ankerl::unordered_dense::map<std::string, std::string, str_mtht_hash> ud;
+    ud.max_load_factor(target_load > 0.0f ? target_load : 0.75f);
+    ud.reserve(keys.size());
+    for (std::size_t i = 0; i < keys.size(); ++i) ud.insert({keys[i], vals[i]});
+
+    volatile uint64_t sink = 0;
+    double best = 1e18;
+    for (int r = 0; r < 7; ++r) {
+        auto t0 = Clock::now();
+        for (const auto& kv : ud)
+            sink += kv.first.size() + kv.second.size() + (unsigned char)kv.second[0];
+        const double d = ms_since(t0);
+        if (d < best) best = d;
+    }
+    (void)sink;
+    return { (double)ud.size() / best, ud.size() };
+#else
+    (void)keys; (void)vals; (void)target_load;
+    return { 0.0, 0 };
+#endif
+}
+
+static void suite_iterate(std::size_t n1_shift, std::size_t ins_pct, float target_load = 0.70f) {
+    std::size_t N1 = std::size_t(1) << n1_shift;
+    const std::size_t nkeys_fill = N1 * ins_pct / 100;
+    if (target_load > 0.0f) {
+        std::size_t want_slots = (std::size_t)((double)nkeys_fill / (double)target_load);
+        N1 = 4;
+        while (N1 < want_slots) N1 <<= 1;
+    }
+    const std::size_t nkeys = nkeys_fill;
+    const StringKeys keys = gen_strings(nkeys, 0x12345678ULL);
+    const StringKeys vals = gen_values(nkeys, 0x9E3779B9ULL);
+
+    out::line("== iteration (string keys, string values, target load %.2f) ==",
+              (double)target_load);
+    out::line("  inserted=%zu  MTHT t1=%zu", nkeys, N1);
+
+    const IterResult m = time_mtht_iter(keys, vals, N1);
+    const IterResult rr = time_robin_iter(keys, vals, N1, target_load);
+    const IterResult rd = time_udense_iter(keys, vals, N1, target_load);
+
+    out::line("  %-18s %12s %10s", "", "Mvisits/s", "keys");
+    out::line("  %s", std::string(44, '-').c_str());
+    out::line("  %-18s %12.1f %10zu", "MTHT iter()", m.kps / 1000.0, m.n);
+    out::line("  %-18s %12.1f %10zu", "tsl::robin_map", rr.kps / 1000.0, rr.n);
+    out::line("  %-18s %12.1f %10zu", "ankerl::unordered_dense", rd.kps / 1000.0, rd.n);
+    out::line("  MTHT vs tsl::robin_map        %6.2fx", m.kps / rr.kps);
+    out::line("  MTHT vs ankerl::unordered_dense %6.2fx", m.kps / rd.kps);
+    out::line("");
+    out::line("  MTHT iter() walks the record store in insertion order and hands out a");
+    out::line("  pointer to each key; read_key/read_str decode the header around it. The");
+    out::line("  peers walk their own storage, so each visit touches whatever layout that");
+    out::line("  container chose.");
+    out::line("");
+}
+
 static void suite_peers(std::size_t n1_shift, std::size_t t2_div, std::size_t ins_pct,
                         const std::vector<std::string>& want, float target_load = 0.70f) {
     std::size_t N1 = std::size_t(1) << n1_shift;
@@ -1012,6 +1150,7 @@ int main(int argc, char** argv) {
     bool do_correctness = true, do_mtht = true, do_peers = true, quick = false;
     bool do_loads = true;
     bool do_peers_strings = true;
+    bool do_iterate = true;
     bool list_peers = false;
     std::vector<std::string> peer_sel;
     std::vector<std::string> peer_sel_raw;
@@ -1025,6 +1164,7 @@ int main(int argc, char** argv) {
             do_peers = (s == "all" || s == "peers");
             do_loads = (s == "all" || s == "loads");
             do_peers_strings = (s == "all" || s == "peers" || s == "strings");
+            do_iterate = (s == "all" || s == "iterate");
         } else if (a.rfind("--peers=", 0) == 0) {
             // comma-separated list of registry names
             std::string list = a.substr(8);
@@ -1057,7 +1197,7 @@ int main(int argc, char** argv) {
             ins_pct = (std::size_t)std::atoi(a.c_str() + 7);
         } else {
             std::printf("unknown arg: %s\n", a.c_str());
-            std::printf("usage: %s [--suite=all|correctness|mtht|loads|peers|strings]"
+            std::printf("usage: %s [--suite=all|correctness|mtht|loads|peers|strings|iterate]"
                         " [--peers=NAME,...] [--list-peers]"
                         " [--log=PATH|--no-log] [--quick]"
                         " [--n1=20] [--t2div=8] [--fill=75]\n", argv[0]);
@@ -1102,6 +1242,7 @@ int main(int argc, char** argv) {
     if (do_loads) suite_mtht_loads(n1_shift, t2_div, ins_pct);
     if (do_peers) suite_peers(n1_shift, t2_div, ins_pct, peer_sel_raw, 0.75f);
     if (do_peers_strings) suite_peers_strings(n1_shift, t2_div, ins_pct, peer_sel_raw, 0.75f);
+    if (do_iterate) suite_iterate(n1_shift, ins_pct, 0.75f);
 
     out::line("done %s%s", now_string().c_str(), log_path.empty() ? "" : ("  -> " + log_path).c_str());
     out::close();
