@@ -224,11 +224,11 @@ inline uint8_t get_fingerprint(const Entry& e) {
     return static_cast<uint8_t>((e.word >> FP_SHIFT) & FP_MASK);
 }
 
-inline bool write_slot(Entry& e, uint8_t fp, const void* val, uint8_t state) {
+inline void* write_slot(Entry& e, uint8_t fp, void* val, uint8_t state) {
     uint64_t dmax = e.word & (DMAX_MASK << DMAX_SHIFT);
     e.word = encode_pointer(val) | (static_cast<uint64_t>(fp) << FP_SHIFT) | dmax |
              (static_cast<uint64_t>(state) << STATE_SHIFT);
-    return true;
+    return val;
 }
 
 // Move src into dst with a new state, clearing src's occupancy but keeping its
@@ -486,50 +486,50 @@ public:
         key_store_.clear();
     }
 
-    bool insert(uint64_t key, const void* bytes, std::size_t bytes_len) {
+    void* insert(uint64_t key, const void* bytes, std::size_t bytes_len) {
         return insert_key_8(&key, bytes, bytes_len);
     }
     // An int-int record: 8-byte key, 8-byte value.
-    bool insert(uint64_t key, uint64_t value) {
+    void* insert(uint64_t key, uint64_t value) {
         return insert_key_8(&key, &value, sizeof value);
     }
-    bool insert(std::string_view key, const void* bytes, std::size_t bytes_len) {
+    void* insert(std::string_view key, const void* bytes, std::size_t bytes_len) {
         if (key.size() == 8) return insert_key_8(key.data(), bytes, bytes_len);
         return insert_key(key.data(), key.size(), bytes, bytes_len);
     }
-    bool insert(const void* key, std::size_t key_len, const void* bytes,
-                std::size_t bytes_len) {
+    void* insert(const void* key, std::size_t key_len, const void* bytes,
+                 std::size_t bytes_len) {
         if (key_len == 8) return insert_key_8(key, bytes, bytes_len);
         return insert_key(key, key_len, bytes, bytes_len);
     }
-    bool insert(std::string_view key, const std::string& value) {
+    void* insert(std::string_view key, const std::string& value) {
         if (key.size() == 8) return insert_key_8_str(key.data(), value);
         return insert_key_str(key.data(), key.size(), value);
     }
 
-    bool insert_key(const void* key, std::size_t key_len, const void* bytes,
-                    std::size_t bytes_len) {
+    void* insert_key(const void* key, std::size_t key_len, const void* bytes,
+                     std::size_t bytes_len) {
         void* rec = key_store_.store(key, key_len, bytes, bytes_len);
-        if (!rec) return false;
+        if (!rec) return nullptr;
 
         const uint64_t hh = hash_(key, key_len);
         return insert_place(key, key_len, hh, rec, true);
     }
-    bool insert_key_8(const void* key, const void* bytes, std::size_t bytes_len) {
+    void* insert_key_8(const void* key, const void* bytes, std::size_t bytes_len) {
         const uint64_t hh = hash_(key);
         const uint64_t key_val = read_word(key);
 
         void* rec = key_store_.store(key, 8, bytes, bytes_len);
-        if (!rec) return false;
+        if (!rec) return nullptr;
 
         return insert_place_8(key_val, hh, rec, true);
     }
 
-    bool insert_key_str(const void* key, std::size_t key_len, const std::string& value) {
+    void* insert_key_str(const void* key, std::size_t key_len, const std::string& value) {
         return insert_key(key, key_len, value.data(), value.size());
     }
 
-    bool insert_key_8_str(const void* key, const std::string& value) {
+    void* insert_key_8_str(const void* key, const std::string& value) {
         return insert_key_8(key, value.data(), value.size());
     }
 
@@ -590,8 +590,8 @@ public:
         return nullptr;
     }
 
-    bool insert_place(const void* key, std::size_t key_len, uint64_t hh, void* val,
-                      bool check_existing) {
+    void* insert_place(const void* key, std::size_t key_len, uint64_t hh, void* val,
+                       bool check_existing) {
         const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
         const uint8_t fp = fingerprint_of_hash(hh);
         Entry& home = t1_[h];
@@ -622,7 +622,7 @@ public:
                 key_store_.mark_dead(decode_pointer(hit->word));
                 ++deleted_;
                 hit->word = (hit->word & ~PTR_MASK) | encode_pointer(val);
-                return true;
+                return val;
             }
         }
 
@@ -665,7 +665,7 @@ public:
 
         return insert_into_T2(hh, h, val);
     }
-    bool insert_place_8(uint64_t key_val, uint64_t hh, void* val, bool check_existing) {
+    void* insert_place_8(uint64_t key_val, uint64_t hh, void* val, bool check_existing) {
         const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
         const uint8_t fp = fingerprint_of_hash(hh);
         Entry& home = t1_[h];
@@ -696,7 +696,7 @@ public:
                 key_store_.mark_dead(decode_pointer(hit->word));
                 ++deleted_;
                 hit->word = (hit->word & ~PTR_MASK) | encode_pointer(val);
-                return true;
+                return val;
             }
         }
 
@@ -1043,10 +1043,10 @@ private:
         }
     }
 
-    bool insert_into_T2(uint64_t hh, uint64_t h, void* val) {
+    void* insert_into_T2(uint64_t hh, uint64_t h, void* val) {
         if (t2_count_ >= (n2_ >> 2) * 3) {
             if (!grow_to(n1_ * 2)) {
-                return false;
+                return nullptr;
             }
             h = fast_map(hh, static_cast<uint64_t>(n1_));
         }
@@ -1065,7 +1065,7 @@ private:
                 return write_slot(t2_[idx], fingerprint_of_hash(hh), val, ST_OFF_ZERO);
             }
         }
-        return false;
+        return nullptr;
     }
 
     bool grow_to(std::size_t new_n1) {

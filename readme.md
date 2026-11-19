@@ -96,10 +96,10 @@ int answer = table.find_as<int>("answer");
 const char key[4] = {'a', 'b', 'c', 'd'};
 std::size_t key_len = sizeof key;
 std::uint8_t val[64] = {};
-table.insert(key, key_len, val, sizeof val);
-void* entry = table.find(key, key_len);
-std::string_view k = mtht::read_key(entry);   // the stored key
-std::string_view v = mtht::read_str(entry);   // its value
+void* entry = table.insert(key, key_len, val, sizeof val);  // the stored item
+void* found = table.find(key, key_len);
+std::string_view k = mtht::read_key(found);   // the stored key
+std::string_view v = mtht::read_str(found);   // its value
 int answer = mtht::read_as<int>(table.find("answer"));  // 0 if absent
 table.erase(key, key_len);
 
