@@ -602,7 +602,11 @@ public:
         const uint8_t s_left = get_state(left);
 
         if (check_existing) {
+            // pull_neighbors_home never leaves an offset entry when home is empty.
             Entry* hit = nullptr;
+            if (s_home == ST_EMPTY) {
+                goto check_t2;
+            }
             if (s_home == ST_OFF_ZERO && slot_holds_fp(home, key, key_len, fp)) {
                 hit = &home;
             } else if (slot_holds_fp(right, key, key_len, fp)) {
@@ -610,6 +614,7 @@ public:
             } else if (slot_holds_fp(left, key, key_len, fp)) {
                 hit = &left;
             } else {
+            check_t2:
                 const uint8_t max_offset = get_t2_max_offset(home);
                 if (max_offset) hit = slot_for_key_T2(h, key, key_len, fp, max_offset);
             }
@@ -671,7 +676,11 @@ public:
         const uint8_t s_left = get_state(left);
 
         if (check_existing) {
+            // Same as insert_place.
             Entry* hit = nullptr;
+            if (s_home == ST_EMPTY) {
+                goto check_t2;
+            }
             if (s_home == ST_OFF_ZERO && slot_holds_fp_8(home, key_val, fp)) {
                 hit = &home;
             } else if (slot_holds_fp_8(right, key_val, fp)) {
@@ -679,6 +688,7 @@ public:
             } else if (slot_holds_fp_8(left, key_val, fp)) {
                 hit = &left;
             } else {
+            check_t2:
                 const uint8_t max_offset = get_t2_max_offset(home);
                 if (max_offset) hit = slot_for_key_T2_8(h, key_val, fp, max_offset);
             }
