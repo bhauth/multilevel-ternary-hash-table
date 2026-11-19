@@ -45,10 +45,12 @@
 //   is untracked (see .gitignore) -- a run record, not a source artifact.
 //
 // SUITES
-//   correctness  -- builds each distribution, verifies every key reads back,
-//                   then walks the raw slot arrays to check the placement
-//                   invariant. A perf number from a table that failed this is
-//                   worthless, so timing is skipped if this fails.
+//   correctness  -- on two distributions (sequential: keys land on their own
+//                   home slots, so erase covers every home/offset arity;
+//                   random: spread homes with moving neighbours). Each gets
+//                   insert/readback/miss, then overwrite, erase and re-insert,
+//                   all verified through find(). A perf number from a table that
+//                   failed this is worthless, so timing is skipped if this fails.
 //   mtht         -- MTHT alone across the key distributions: insert/find time,
 //                   throughput and occupancy.
 //   loads        -- MTHT alone, one row per fill step from N1/12 up to N1, with
@@ -308,7 +310,9 @@ static std::vector<Dist> distributions(std::size_t n) {
 
 // ---------------------------------------------------------------------------
 // Suite: correctness. Inserts every key, verifies readback, and confirms
-// absent keys miss. Must pass before any timing is trusted.
+// absent keys miss. Then overwrites, erases and re-inserts, verifying each
+// phase through find(). Erase is the one that exercises pull_neighbors_home.
+// Must pass before any timing is trusted.
 // ---------------------------------------------------------------------------
 static bool suite_correctness(std::size_t n1_shift, std::size_t t2_div,
                               std::size_t ins_pct, int* checks_out) {
@@ -317,10 +321,31 @@ static bool suite_correctness(std::size_t n1_shift, std::size_t t2_div,
     const std::size_t nkeys = N1 * ins_pct / 100;
     int checks = 0, fails = 0;
 
+    // One check, printing a [FAIL] line and counting against the suite.
+    auto expect = [&](bool ok, const char* dist, const char* phase, const char* what,
+                      std::size_t got, std::size_t want) {
+        ++checks;
+        if (ok) return;
+        ++fails;
+        out::line("  [FAIL] %-11s %-10s %s %zu/%zu", dist, phase, what, got, want);
+    };
+    // The value a key reads back as, or a miss.
+    auto read_u64 = [](const mtht::Table& t, uint64_t k, uint64_t* out) -> bool {
+        const void* p = t.find(k);
+        if (!p) return false;
+        *out = *reinterpret_cast<const uint64_t*>(mtht::read_str(p).data());
+        return true;
+    };
+
     out::line("== correctness ==");
     out::line("  N1=%zu N2=%zu keys=%zu", N1, N2, nkeys);
 
-    for (Dist& d : distributions(nkeys)) {
+    // sequential: keys land on their own home slots, so erase hits every
+    // home/offset arity. random: spread homes whose neighbours can move.
+    std::vector<Dist> dists = distributions(nkeys);
+    dists.resize(2);
+
+    for (Dist& d : dists) {
         mtht::Table t(N1, sizeof(uint64_t));
 
         // Distinct-key check, so a duplicate cannot silently inflate `ok`.
@@ -334,24 +359,94 @@ static bool suite_correctness(std::size_t n1_shift, std::size_t t2_div,
 
         std::size_t found = 0, wrong_val = 0;
         for (uint64_t k : d.keys) {
-            const void* p = t.find(k);
-            if (!p) continue;
+            uint64_t v;
+            if (!read_u64(t, k, &v)) continue;
             ++found;
-            if (*reinterpret_cast<const uint64_t*>(mtht::read_str(p).data()) != k) ++wrong_val;
+            if (v != k) ++wrong_val;
         }
-        const Keys absent = gen_absent(nkeys, 0xFACEULL);
         std::size_t false_pos = 0;
-        for (uint64_t k : absent)
+        for (uint64_t k : gen_absent(nkeys, 0xFACEULL))
             if (t.find(k)) ++false_pos;
 
-        checks += 3;
-        if (!distinct) { ++fails; out::line("  [FAIL] %-11s generator produced duplicates", d.name); }
-        if (inserted != nkeys) { ++fails; out::line("  [FAIL] %-11s inserted %zu/%zu", d.name, inserted, nkeys); }
-        if (found != inserted || wrong_val) { ++fails; out::line("  [FAIL] %-11s found %zu/%zu wrong_val=%zu", d.name, found, inserted, wrong_val); }
+        // Overwrite: each key takes a new value. The replacement is looked up
+        // through find(), so the old record cannot be the one served.
+        std::size_t over_ok = 0;
+        for (uint64_t k : d.keys) {
+            const uint64_t v = ~k;
+            uint64_t got = 0;
+            if (t.insert(k, &v, sizeof v) && read_u64(t, k, &got) && got == v) ++over_ok;
+        }
+        // Overwriting with the same value must not lose the entry.
+        std::size_t again_ok = 0;
+        for (uint64_t k : d.keys) {
+            const uint64_t v = ~k;
+            uint64_t got = 0;
+            if (t.insert(k, &v, sizeof v) && read_u64(t, k, &got) && got == v) ++again_ok;
+        }
+
+        // Erase half the keys in reverse insertion order, so each erase leaves
+        // a gap its neighbours have to close.
+        const std::size_t size_before_er = t.size();
+        std::vector<bool> gone(d.keys.size(), false);
+        std::size_t er_ok = 0, er_live = 0;
+        for (std::size_t i = d.keys.size(); i-- > 0 && er_ok < nkeys / 2;) {
+            const uint64_t k = d.keys[i];
+            gone[i] = true;
+            if (t.erase(k)) ++er_ok;
+            if (t.find(k)) ++er_live;
+        }
+        // Erasing an absent key reports it.
+        std::size_t er_again = 0;
+        for (std::size_t i = 0; i < d.keys.size(); ++i)
+            if (gone[i] && t.erase(d.keys[i])) ++er_again;
+        // Survivors read back, with the value the overwrite left.
+        std::size_t keep_ok = 0;
+        for (std::size_t i = 0; i < d.keys.size(); ++i) {
+            if (gone[i]) continue;
+            uint64_t got = 0;
+            if (read_u64(t, d.keys[i], &got) && got == ~d.keys[i]) ++keep_ok;
+        }
+        const std::size_t survivors = nkeys - er_ok;
+        const std::size_t size_after_er = t.size();
+        const bool size_er_delta = size_after_er == size_before_er - er_ok;
+
+        // Erase the rest: down to size 0 with every key missing.
+        std::size_t er_all = 0;
+        for (uint64_t k : d.keys)
+            if (t.erase(k)) ++er_all;
+        std::size_t er_fail_live = 0;
+        for (uint64_t k : d.keys)
+            if (t.find(k)) ++er_fail_live;
+        const std::size_t size_after_all = t.size();
+
+        // Re-insert into the gaps the erases left.
+        std::size_t back_ok = 0;
+        for (uint64_t k : d.keys) {
+            uint64_t got = 0;
+            if (t.insert(k, &k, sizeof k) && read_u64(t, k, &got) && got == k) ++back_ok;
+        }
+
+        expect(distinct, d.name, "insert", "generator made duplicates", nkeys, 0);
+        expect(inserted == nkeys, d.name, "insert", "accepted", inserted, nkeys);
+        expect(found == inserted && !wrong_val, d.name, "insert", "read back", found, inserted);
+        expect(!false_pos, d.name, "insert", "absent keys found", false_pos, 0);
+        expect(over_ok == nkeys, d.name, "overwrite", "new value read back", over_ok, nkeys);
+        expect(t.size() == nkeys, d.name, "overwrite", "size", t.size(), nkeys);
+        expect(again_ok == nkeys, d.name, "re-overwrite", "same value read back", again_ok, nkeys);
+        expect(er_ok == nkeys / 2, d.name, "erase", "accepted", er_ok, nkeys / 2);
+        expect(!er_live, d.name, "erase", "erased keys still live", er_live, 0);
+        expect(!er_again, d.name, "erase", "second erase reported", er_again, 0);
+        expect(keep_ok == survivors, d.name, "erase", "survivors read back", keep_ok, survivors);
+        expect(size_er_delta, d.name, "erase", "size delta", size_after_er, size_before_er - er_ok);
+        expect(er_all == survivors, d.name, "erase-all", "accepted", er_all, survivors);
+        expect(!er_fail_live, d.name, "erase-all", "keys still live", er_fail_live, 0);
+        expect(size_after_all == 0, d.name, "erase-all", "size", size_after_all, 0);
+        expect(back_ok == nkeys, d.name, "re-insert", "read back", back_ok, nkeys);
+        expect(t.size() == nkeys, d.name, "re-insert", "size", t.size(), nkeys);
 
         // One compact row per distribution. A passing row is just its numbers.
-        out::line("  %-11s keys=%-7zu found=%-7zu fp=%-3zu t1=%.3f t2=%.3f",
-                  d.name, inserted, found, false_pos, t.load1(), t.load2());
+        out::line("  %-11s keys=%-7zu over=%-7zu er=%-7zu back=%-7zu t1=%.3f t2=%.3f",
+                  d.name, inserted, over_ok, er_ok, back_ok, t.load1(), t.load2());
     }
     out::line("  %d checks, %d failures", checks, fails);
     out::line("");
