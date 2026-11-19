@@ -227,7 +227,7 @@ inline uint8_t get_fingerprint(const Entry& e) {
 inline bool write_slot(Entry& e, uint8_t fp, const void* val, uint8_t state) {
     uint64_t dmax = e.word & (DMAX_MASK << DMAX_SHIFT);
     e.word = encode_pointer(val) | (static_cast<uint64_t>(fp) << FP_SHIFT) | dmax |
-             (static_cast<uint64_t>(state & 0x03) << STATE_SHIFT);
+             (static_cast<uint64_t>(state) << STATE_SHIFT);
     return true;
 }
 
@@ -236,7 +236,7 @@ inline bool write_slot(Entry& e, uint8_t fp, const void* val, uint8_t state) {
 inline void shift_entry(Entry& src, Entry& dst, uint8_t new_state) {
     uint64_t dmax = dst.word & (DMAX_MASK << DMAX_SHIFT);
     dst.word = (src.word & (PTR_MASK | (FP_MASK << FP_SHIFT))) | dmax |
-               (static_cast<uint64_t>(new_state & 0x03) << STATE_SHIFT);
+               (static_cast<uint64_t>(new_state) << STATE_SHIFT);
     src.word &= ~(STATE_MASK << STATE_SHIFT);
 }
 
