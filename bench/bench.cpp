@@ -5,7 +5,7 @@
 //   ./temp/bench.exe [n1_shift] [t2_div] [insert_pct]
 //
 // IMPORTANT: the generators emit RAW keys. They are not pre-mixed, so the
-// table's own hash_key/fast_map pipeline does all the mixing -- sequential and
+// table's own hash_key pipeline does all the mixing -- sequential and
 // strided keys stay adversarial, which is the point of measuring them. Only
 // `random` uses splitmix, since a random distribution is by definition mixed.
 

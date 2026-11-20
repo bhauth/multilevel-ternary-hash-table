@@ -5,7 +5,7 @@
 //           -Ipeers/robin-map-master/include -Ipeers/ankerl-unordered_dense \
 //           bench/mthtbench.cpp -o temp/mthtbench.exe
 //   (temp/ is git-ignored; the exe is a scratch artifact. -march=native matters:
-//    the fast_map path uses 128-bit multiplies, so the numbers depend on it.)
+//    the hash path uses 128-bit multiplies, so the numbers depend on it.)
 //
 // HOW TO RUN
 //   ./temp/mthtbench.exe                # every suite, writes bench/mthtbench.log

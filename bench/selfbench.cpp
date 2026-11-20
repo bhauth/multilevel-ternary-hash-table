@@ -11,7 +11,7 @@
 //   clang++ -O2 -std=c++20 -march=native -Iinclude \
 //           bench/selfbench.cpp -o temp/selfbench.exe
 //   (temp/ is git-ignored; the exe is a scratch artifact. -march=native matters:
-//    the fast_map path uses 128-bit multiplies, so the numbers depend on it.)
+//    the hash path uses 128-bit multiplies, so the numbers depend on it.)
 //
 // HOW TO RUN
 //   ./temp/selfbench.exe                # every suite, writes bench/selfbench.log

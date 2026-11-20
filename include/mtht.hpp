@@ -46,10 +46,6 @@ static constexpr uint64_t STATE_MASK = 0x03ULL;
 static constexpr uint64_t DMAX_SHIFT = 58;
 static constexpr uint64_t DMAX_MASK = 0x3FULL;
 
-inline uint64_t fast_map(uint64_t hash) {
-    return (hash << 16) | (hash >> 48);
-}
-
 inline uint8_t get_state(const Entry& e) {
     return static_cast<uint8_t>((e.word >> STATE_SHIFT) & STATE_MASK);
 }
@@ -193,15 +189,16 @@ inline T read_as(const void* ptr) {
 //
 // The bits of h are spoken for elsewhere, so the fingerprint takes a byte clear
 // of all of them rather than mixing a shared one:
-//   [7..0]   the low byte, so a fingerprint there would agree exactly for keys
+//   [15..0]  the low half, so a fingerprint there would agree exactly for keys
 //            that already share a home slot -- the one case the filter exists
 //            to reject.
-//   [63..56] the slot index is fast_map(hash) & mask1_
-//   The header of an entry is [57..56] state, [63..58] D_max; the fingerprint
-//   rides in [55..48] beside a 48-bit pointer, so its tag cannot reach [56..63].
+//   [47..16] the T2 band index
+//   [63..56] the top byte, clear of both. The header of an entry is [57..56]
+//   state, [63..58] D_max; the fingerprint rides in [55..48] beside a 48-bit
+//   pointer, so its tag cannot reach [56..63].
 // hash_key avalanches all 64 bits before this point.
 inline uint8_t fingerprint_of_hash(uint64_t h) {
-    return static_cast<uint8_t>(h >> 8);
+    return static_cast<uint8_t>(h >> 56);
 }
 
 inline uint64_t hash_bytes(const void* p, std::size_t len) {
@@ -531,30 +528,30 @@ public:
         return insert_key_8(key, value.data(), value.size());
     }
 
-    Entry* slot_for_key(const void* key, std::size_t key_len, uint64_t h, uint8_t fp,
+    Entry* slot_for_key(const void* key, std::size_t key_len, uint64_t hh, uint8_t fp,
                         bool& in_t1) {
-        Entry& home = t1_[h];
+        Entry& home = t1_[hh & mask1_];
         if (get_state(home) == ST_OFF_ZERO && slot_holds_fp(home, key, key_len, fp)) {
             in_t1 = true;
             return &home;
         }
 
         const int first = +1;
-        Entry& n1 = t1_[(h + static_cast<uint64_t>(first)) & mask1_];
+        Entry& n1 = t1_[(hh + static_cast<uint64_t>(first)) & mask1_];
         if (slot_holds_fp(n1, key, key_len, fp)) { in_t1 = true; return &n1; }
-        Entry& n2 = t1_[(h + static_cast<uint64_t>(-first)) & mask1_];
+        Entry& n2 = t1_[(hh + static_cast<uint64_t>(-first)) & mask1_];
         if (slot_holds_fp(n2, key, key_len, fp)) { in_t1 = true; return &n2; }
 
         uint8_t max_offset = get_t2_max_offset(home);
         if (max_offset == 0) return nullptr;
-        Entry* e = slot_for_key_T2(h, key, key_len, fp, max_offset);
+        Entry* e = slot_for_key_T2(hh, key, key_len, fp, max_offset);
         if (e) in_t1 = false;
         return e;
     }
 
-    Entry* slot_for_key_T2(uint64_t h, const void* key, std::size_t key_len, uint8_t fp,
+    Entry* slot_for_key_T2(uint64_t hh, const void* key, std::size_t key_len, uint8_t fp,
                            uint8_t max_offset) {
-        uint64_t base_t2 = (h >> SHIFT_RATIO) & mask2_;
+        uint64_t base_t2 = (hh >> 32) & mask2_;
 
         for (int off = static_cast<int>(max_offset) - 1; off >= 0; --off) {
             Entry& e = t2_[(base_t2 + static_cast<uint64_t>(off)) & mask2_];
@@ -571,8 +568,8 @@ public:
     }
 
     __attribute__((noinline))
-    Entry* slot_for_key_T2_8(uint64_t h, uint64_t key_val, uint8_t fp, uint8_t max_offset) {
-        uint64_t base_t2 = (h >> SHIFT_RATIO) & mask2_;
+    Entry* slot_for_key_T2_8(uint64_t hh, uint64_t key_val, uint8_t fp, uint8_t max_offset) {
+        uint64_t base_t2 = (hh >> 32) & mask2_;
 
         for (int off = static_cast<int>(max_offset) - 1; off >= 0; --off) {
             Entry& e = t2_[(base_t2 + static_cast<uint64_t>(off)) & mask2_];
@@ -590,11 +587,10 @@ public:
 
     void* insert_place(const void* key, std::size_t key_len, uint64_t hh, void* val,
                        bool check_existing) {
-        const uint64_t h = fast_map(hh) & mask1_;
         const uint8_t fp = fingerprint_of_hash(hh);
-        Entry& home = t1_[h];
-        Entry& right = t1_[(h + 1) & mask1_];
-        Entry& left = t1_[(h - 1) & mask1_];
+        Entry& home = t1_[hh & mask1_];
+        Entry& right = t1_[(hh + 1) & mask1_];
+        Entry& left = t1_[(hh - 1) & mask1_];
         const uint8_t s_home = get_state(home);
         const uint8_t s_right = get_state(right);
         const uint8_t s_left = get_state(left);
@@ -614,7 +610,7 @@ public:
             } else {
             check_t2:
                 const uint8_t max_offset = get_t2_max_offset(home);
-                if (max_offset) hit = slot_for_key_T2(h, key, key_len, fp, max_offset);
+                if (max_offset) hit = slot_for_key_T2(hh, key, key_len, fp, max_offset);
             }
             if (hit) {
                 key_store_.mark_dead(decode_pointer(hit->word));
@@ -643,7 +639,7 @@ public:
         //    Only an entry at offset 0 can be pushed: one offset left can't
         //    be pushed left, and offset right means it was pushed by something at the left.
         if (s_right == ST_OFF_ZERO) {
-            const uint64_t far_right = (h + 2) & mask1_;
+            const uint64_t far_right = (hh + 2) & mask1_;
             Entry& next_right = t1_[far_right];
             if (get_state(next_right) == ST_EMPTY) {
                 shift_entry(right, next_right, ST_OFF_POS);
@@ -653,7 +649,7 @@ public:
 
         // 4. Mirror on the left: same reasoning, offset 0 only.
         if (s_left == ST_OFF_ZERO) {
-            const uint64_t far_left = (h - 2) & mask1_;
+            const uint64_t far_left = (hh - 2) & mask1_;
             Entry& next_left = t1_[far_left];
             if (get_state(next_left) == ST_EMPTY) {
                 shift_entry(left, next_left, ST_OFF_NEG);
@@ -661,14 +657,13 @@ public:
             }
         }
 
-        return insert_into_T2(hh, h, val);
+        return insert_into_T2(hh, val);
     }
     void* insert_place_8(uint64_t key_val, uint64_t hh, void* val, bool check_existing) {
-        const uint64_t h = fast_map(hh) & mask1_;
         const uint8_t fp = fingerprint_of_hash(hh);
-        Entry& home = t1_[h];
-        Entry& right = t1_[(h + 1) & mask1_];
-        Entry& left = t1_[(h - 1) & mask1_];
+        Entry& home = t1_[hh & mask1_];
+        Entry& right = t1_[(hh + 1) & mask1_];
+        Entry& left = t1_[(hh - 1) & mask1_];
         const uint8_t s_home = get_state(home);
         const uint8_t s_right = get_state(right);
         const uint8_t s_left = get_state(left);
@@ -688,7 +683,7 @@ public:
             } else {
             check_t2:
                 const uint8_t max_offset = get_t2_max_offset(home);
-                if (max_offset) hit = slot_for_key_T2_8(h, key_val, fp, max_offset);
+                if (max_offset) hit = slot_for_key_T2_8(hh, key_val, fp, max_offset);
             }
             if (hit) {
                 key_store_.mark_dead(decode_pointer(hit->word));
@@ -708,7 +703,7 @@ public:
             return write_slot(left, fp, val, ST_OFF_NEG);
         }
         if (s_right == ST_OFF_ZERO) {
-            const uint64_t far_right = (h + 2) & mask1_;
+            const uint64_t far_right = (hh + 2) & mask1_;
             Entry& next_right = t1_[far_right];
             if (get_state(next_right) == ST_EMPTY) {
                 shift_entry(right, next_right, ST_OFF_POS);
@@ -716,14 +711,14 @@ public:
             }
         }
         if (s_left == ST_OFF_ZERO) {
-            const uint64_t far_left = (h - 2) & mask1_;
+            const uint64_t far_left = (hh - 2) & mask1_;
             Entry& next_left = t1_[far_left];
             if (get_state(next_left) == ST_EMPTY) {
                 shift_entry(left, next_left, ST_OFF_NEG);
                 return write_slot(left, fp, val, ST_OFF_NEG);
             }
         }
-        return insert_into_T2(hh, h, val);
+        return insert_into_T2(hh, val);
     }
 
 
@@ -769,28 +764,27 @@ public:
 
     void* find_key_8_val(uint64_t key_val) const {
         const uint64_t hh = hash_key(key_val);
-        const uint64_t h = fast_map(hh) & mask1_;
         const uint8_t fp = fingerprint_of_hash(hh);
-        const Entry& home = t1_[h];
+        const Entry& home = t1_[hh & mask1_];
 
         if (get_state(home) == ST_OFF_ZERO && slot_holds_fp_8(home, key_val, fp)) {
             return decode_pointer(home.word);
         }
 
         const int first = +1;
-        const Entry& n1 = t1_[(h + (uint64_t)first) & mask1_];
+        const Entry& n1 = t1_[(hh + (uint64_t)first) & mask1_];
         if (slot_holds_fp_8(n1, key_val, fp)) return decode_pointer(n1.word);
-        const Entry& n2 = t1_[(h + (uint64_t)-first) & mask1_];
+        const Entry& n2 = t1_[(hh + (uint64_t)-first) & mask1_];
         if (slot_holds_fp_8(n2, key_val, fp)) return decode_pointer(n2.word);
 
         uint8_t max_offset = get_t2_max_offset(home);
         if (max_offset == 0) return nullptr;
-        return find_in_T2_8(h, key_val, fp, max_offset);
+        return find_in_T2_8(hh, key_val, fp, max_offset);
     }
 
     __attribute__((noinline))
-    void* find_in_T2_8(uint64_t h, uint64_t key_val, uint8_t fp, uint8_t max_offset) const {
-        uint64_t base_t2 = (h >> SHIFT_RATIO) & mask2_;
+    void* find_in_T2_8(uint64_t hh, uint64_t key_val, uint8_t fp, uint8_t max_offset) const {
+        uint64_t base_t2 = (hh >> 32) & mask2_;
 
         for (int off = static_cast<int>(max_offset) - 1; off >= 0; --off) {
             const Entry& e = t2_[(base_t2 + static_cast<uint64_t>(off)) & mask2_];
@@ -808,27 +802,26 @@ public:
 
     void* find_key(const void* key, std::size_t key_len) const {
         const uint64_t hh = hash_(key, key_len);
-        const uint64_t h = fast_map(hh) & mask1_;
         const uint8_t fp = fingerprint_of_hash(hh);
-        const Entry& home = t1_[h];
+        const Entry& home = t1_[hh & mask1_];
 
         if (get_state(home) == ST_OFF_ZERO && slot_holds_fp(home, key, key_len, fp)) {
             return decode_pointer(home.word);
         }
 
         const int first = +1;
-        const Entry& n1 = t1_[(h + (uint64_t)first) & mask1_];
+        const Entry& n1 = t1_[(hh + (uint64_t)first) & mask1_];
         if (slot_holds_fp(n1, key, key_len, fp)) {
             return decode_pointer(n1.word);
         }
-        const Entry& n2 = t1_[(h + (uint64_t)-first) & mask1_];
+        const Entry& n2 = t1_[(hh + (uint64_t)-first) & mask1_];
         if (slot_holds_fp(n2, key, key_len, fp)) {
             return decode_pointer(n2.word);
         }
 
         uint8_t max_offset = get_t2_max_offset(home);
         if (max_offset == 0) return nullptr;
-        return find_in_T2(h, key, key_len, fp, max_offset);
+        return find_in_T2(hh, key, key_len, fp, max_offset);
     }
 
     // ---- insertion-order iteration -------------------------------------
@@ -964,9 +957,9 @@ private:
         goto walk;
     }
 
-    void* find_in_T2(uint64_t h, const void* key, std::size_t key_len, uint8_t fp,
+    void* find_in_T2(uint64_t hh, const void* key, std::size_t key_len, uint8_t fp,
                      uint8_t max_offset) const {
-        uint64_t base_t2 = (h >> SHIFT_RATIO) & mask2_;
+        uint64_t base_t2 = (hh >> 32) & mask2_;
 
         for (int off = static_cast<int>(max_offset) - 1; off >= 0; --off) {
             const Entry& e = t2_[(base_t2 + static_cast<uint64_t>(off)) & mask2_];
@@ -993,11 +986,10 @@ public:
 private:
     bool erase_key(const void* key, std::size_t key_len) {
         const uint64_t hh = hash_(key, key_len);
-        const uint64_t h = fast_map(hh) & mask1_;
         const uint8_t fp = fingerprint_of_hash(hh);
 
         bool in_t1 = false;
-        Entry* e = slot_for_key(key, key_len, h, fp, in_t1);
+        Entry* e = slot_for_key(key, key_len, hh, fp, in_t1);
         if (!e) return false;
 
         key_store_.mark_dead(decode_pointer(e->word));
@@ -1041,25 +1033,25 @@ private:
         }
     }
 
-    void* insert_into_T2(uint64_t hh, uint64_t h, void* val) {
+    void* insert_into_T2(uint64_t hh, void* val) {
         if (t2_count_ >= (n2_ >> 2) * 3) {
             if (!grow_to(n1_ * 2)) {
                 return nullptr;
             }
-            h = fast_map(hh) & mask1_;
         }
 
-        uint64_t base_t2 = (h >> SHIFT_RATIO) & mask2_;
+        uint64_t base_t2 = (hh >> 32) & mask2_;
 
         for (uint64_t off = 0; off < n2_; ++off) {
             uint64_t idx = (base_t2 + off) & mask2_;
             uint8_t st = get_state(t2_[idx]);
             if (st == ST_EMPTY || st == ST_TOMBSTONE) {
                 ++t2_count_;
+                Entry& d_home = t1_[hh & mask1_];
 
                 // Stored as offset + 1, so offset 0 is not "nothing spilled".
                 const uint8_t dmax = std::min<uint8_t>(off + 1, DMAX_SENTINEL);
-                set_t2_max_offset(t1_[h], std::max(get_t2_max_offset(t1_[h]), dmax));
+                set_t2_max_offset(d_home, std::max(get_t2_max_offset(d_home), dmax));
                 return write_slot(t2_[idx], fingerprint_of_hash(hh), val, ST_OFF_ZERO);
             }
         }
