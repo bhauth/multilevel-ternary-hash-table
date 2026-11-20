@@ -46,9 +46,8 @@ static constexpr uint64_t STATE_MASK = 0x03ULL;
 static constexpr uint64_t DMAX_SHIFT = 58;
 static constexpr uint64_t DMAX_MASK = 0x3FULL;
 
-inline uint64_t fast_map(uint64_t hash, uint64_t capacity) {
-    uint64_t r = (hash << 16) | (hash >> 48);
-    return r & (capacity - 1);
+inline uint64_t fast_map(uint64_t hash) {
+    return (hash << 16) | (hash >> 48);
 }
 
 inline uint8_t get_state(const Entry& e) {
@@ -197,7 +196,7 @@ inline T read_as(const void* ptr) {
 //   [7..0]   the low byte, so a fingerprint there would agree exactly for keys
 //            that already share a home slot -- the one case the filter exists
 //            to reject.
-//   [63..56] the slot index is fast_map(hash, n1)
+//   [63..56] the slot index is fast_map(hash) & mask1_
 //   The header of an entry is [57..56] state, [63..58] D_max; the fingerprint
 //   rides in [55..48] beside a 48-bit pointer, so its tag cannot reach [56..63].
 // hash_key avalanches all 64 bits before this point.
@@ -383,7 +382,7 @@ private:
     }
 
     unsigned char* reserve(std::size_t bytes) {
-        if (!bump_ || bytes > bump_left_) {
+        if (bytes > bump_left_) {
             open_block(std::max(bytes, block_bytes_));
         }
         unsigned char* p = bump_;
@@ -449,10 +448,9 @@ public:
 
     explicit BasicTable(std::size_t n1 = DEFAULT_N1, std::size_t store_bytes = 0)
         : key_store_(store_bytes) {
-        if (n1 < 4) n1 = 4;
+        if (n1 < 8) n1 = 8;
         n1 = ceil_pow2(n1);
         n2_ = n1 >> SHIFT_RATIO;
-        if (n2_ < 4) n2_ = 4;
         n1_ = n1;
         mask1_ = n1 - 1;
         mask2_ = n2_ - 1;
@@ -592,7 +590,7 @@ public:
 
     void* insert_place(const void* key, std::size_t key_len, uint64_t hh, void* val,
                        bool check_existing) {
-        const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
+        const uint64_t h = fast_map(hh) & mask1_;
         const uint8_t fp = fingerprint_of_hash(hh);
         Entry& home = t1_[h];
         Entry& right = t1_[(h + 1) & mask1_];
@@ -666,7 +664,7 @@ public:
         return insert_into_T2(hh, h, val);
     }
     void* insert_place_8(uint64_t key_val, uint64_t hh, void* val, bool check_existing) {
-        const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
+        const uint64_t h = fast_map(hh) & mask1_;
         const uint8_t fp = fingerprint_of_hash(hh);
         Entry& home = t1_[h];
         Entry& right = t1_[(h + 1) & mask1_];
@@ -771,7 +769,7 @@ public:
 
     void* find_key_8_val(uint64_t key_val) const {
         const uint64_t hh = hash_key(key_val);
-        const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
+        const uint64_t h = fast_map(hh) & mask1_;
         const uint8_t fp = fingerprint_of_hash(hh);
         const Entry& home = t1_[h];
 
@@ -810,7 +808,7 @@ public:
 
     void* find_key(const void* key, std::size_t key_len) const {
         const uint64_t hh = hash_(key, key_len);
-        const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
+        const uint64_t h = fast_map(hh) & mask1_;
         const uint8_t fp = fingerprint_of_hash(hh);
         const Entry& home = t1_[h];
 
@@ -995,7 +993,7 @@ public:
 private:
     bool erase_key(const void* key, std::size_t key_len) {
         const uint64_t hh = hash_(key, key_len);
-        const uint64_t h = fast_map(hh, static_cast<uint64_t>(n1_));
+        const uint64_t h = fast_map(hh) & mask1_;
         const uint8_t fp = fingerprint_of_hash(hh);
 
         bool in_t1 = false;
@@ -1048,7 +1046,7 @@ private:
             if (!grow_to(n1_ * 2)) {
                 return nullptr;
             }
-            h = fast_map(hh, static_cast<uint64_t>(n1_));
+            h = fast_map(hh) & mask1_;
         }
 
         uint64_t base_t2 = (h >> SHIFT_RATIO) & mask2_;
