@@ -24,30 +24,64 @@ struct alignas(8) Entry {
 
 static_assert(sizeof(Entry) == 8, "Entry must be 8 bytes");
 
-// 2-bit displacement / occupancy state, at bits [57..56] of the word.
+// A slot's word packs two kinds of thing. Bits [56..0] describe the item in
+// the slot -- where its record is, its fingerprint, and whether the slot is
+// occupied -- so they travel with the item when it moves. Bits [63..57] are
+// owned by the slot's own home and stay put: the 3-bit state says which of the
+// three slots at [-1, 0, +1] hold an item homed here, and D_max is the reach of
+// this home's spill into T2.
+//
+//     [63..61] state   [60..57] D_max   [56..49] fingerprint
+//     [48]     occupied                [47..0]  pointer
+static constexpr uint64_t PTR_MASK = 0x0000FFFFFFFFFFFFULL;
+static constexpr int OCC_SHIFT = 48;
+static constexpr uint64_t OCC_BIT = 1ULL << OCC_SHIFT;
+static constexpr uint64_t FP_SHIFT = 49;
+static constexpr uint64_t FP_MASK = 0xFFULL;
+static constexpr uint64_t DMAX_SHIFT = 57;
+static constexpr uint64_t DMAX_MASK = 0x0FULL;
+static constexpr uint64_t STATE_SHIFT = 61;
+static constexpr uint64_t STATE_MASK = 0x07ULL;
+
+// Everything an item carries. Clearing the home's own fields leaves this.
+static constexpr uint64_t ITEM_MASK = OCC_BIT | (FP_MASK << FP_SHIFT) | PTR_MASK;
+
+// 3-bit ownership mask in a slot's state field. Bit i is set when slot
+// (slot - 1 + i) holds an item whose home is this slot.
 enum : uint8_t {
-    ST_EMPTY = 0,  // 00: empty element
-    ST_OFF_NEG = 1, // 01: offset -1 (home is slot_index + 1)
-    ST_OFF_ZERO = 2, // 10: offset 0 (home == slot_index)
-    ST_OFF_POS = 3, // 11: offset +1 (home is slot_index - 1)
+    MASK_MINUS = 1, // 001: slot - 1 holds an item homed here
+    MASK_SELF = 2,  // 010: this slot holds an item homed here
+    MASK_PLUS = 4,  // 100: slot + 1 holds an item homed here
 };
 
-static constexpr uint8_t ST_TOMBSTONE = ST_OFF_NEG;
+// T2 slots reuse the state field for a marker on the item in that slot.
+static constexpr uint8_t T2_EMPTY = 0;
+static constexpr uint8_t T2_LIVE = 1;
+static constexpr uint8_t T2_TOMBSTONE = 4;
 
-static constexpr uint8_t DMAX_SENTINEL = 63;
+static constexpr uint8_t DMAX_SENTINEL = 15;
 
 static constexpr int SHIFT_RATIO = 3;
 
-static constexpr uint64_t PTR_MASK = 0x0000FFFFFFFFFFFFULL;
-static constexpr uint64_t FP_SHIFT = 48;
-static constexpr uint64_t FP_MASK = 0xFFULL;
-static constexpr uint64_t STATE_SHIFT = 56;
-static constexpr uint64_t STATE_MASK = 0x03ULL;
-static constexpr uint64_t DMAX_SHIFT = 58;
-static constexpr uint64_t DMAX_MASK = 0x3FULL;
-
 inline uint8_t get_state(const Entry& e) {
-    return static_cast<uint8_t>((e.word >> STATE_SHIFT) & STATE_MASK);
+    return static_cast<uint8_t>(e.word >> STATE_SHIFT);
+}
+
+// Replace the state field. Every caller sets it to a value it computed, never
+// accumulates into it, so a tombstone (100) cannot survive into a live (001).
+inline void set_state(Entry& e, uint8_t s) {
+    e.word = (e.word & ~(static_cast<uint64_t>(7) << STATE_SHIFT)) |
+             (static_cast<uint64_t>(s) << STATE_SHIFT);
+}
+
+inline bool is_occupied(const Entry& e) { return (e.word & OCC_BIT) != 0; }
+
+// The mask bit that names `slot_idx` from the home at `home_idx`. Compared
+// modulo the table size, so home + 1 wraps to slot 0 at the last slot.
+inline uint8_t mask_bit_for(uint64_t slot_idx, uint64_t home_idx, uint64_t mask1) {
+    if (slot_idx == home_idx) return MASK_SELF;
+    if (slot_idx == ((home_idx + 1) & mask1)) return MASK_PLUS;
+    return MASK_MINUS;
 }
 
 inline uint8_t get_t2_max_offset(const Entry& e) {
@@ -56,7 +90,7 @@ inline uint8_t get_t2_max_offset(const Entry& e) {
 
 inline void set_t2_max_offset(Entry& e, uint8_t dmax) {
     e.word = (e.word & ~(DMAX_MASK << DMAX_SHIFT)) |
-             (static_cast<uint64_t>(dmax & 0x3F) << DMAX_SHIFT);
+             (static_cast<uint64_t>(dmax & DMAX_MASK) << DMAX_SHIFT);
 }
 
 inline void* decode_pointer(uint64_t word) {
@@ -193,12 +227,13 @@ inline T read_as(const void* ptr) {
 //            that already share a home slot -- the one case the filter exists
 //            to reject.
 //   [47..16] the T2 band index
-//   [63..56] the top byte, clear of both. The header of an entry is [57..56]
-//   state, [63..58] D_max; the fingerprint rides in [55..48] beside a 48-bit
-//   pointer, so its tag cannot reach [56..63].
+//   [63..56] the top byte, clear of the pointer, the band index and the low
+//            half. The header of an entry is [63..62] state, [61..54]
+//            fingerprint, [53..48] D_max; the fingerprint rides in [61..54], so
+//            its tag has to be the byte at that position.
 // hash_key avalanches all 64 bits before this point.
 inline uint8_t fingerprint_of_hash(uint64_t h) {
-    return static_cast<uint8_t>(h >> 56);
+    return static_cast<uint8_t>(h >> 54);
 }
 
 inline uint64_t hash_bytes(const void* p, std::size_t len) {
@@ -220,26 +255,36 @@ inline uint8_t get_fingerprint(const Entry& e) {
     return static_cast<uint8_t>((e.word >> FP_SHIFT) & FP_MASK);
 }
 
-inline void* write_slot(Entry& e, uint8_t fp, void* val, uint8_t state) {
-    uint64_t dmax = e.word & (DMAX_MASK << DMAX_SHIFT);
-    e.word = encode_pointer(val) | (static_cast<uint64_t>(fp) << FP_SHIFT) | dmax |
-             (static_cast<uint64_t>(state) << STATE_SHIFT);
+// The item in a slot: its record pointer, whether the slot is occupied, and the
+// fingerprint. This is the whole of ITEM_MASK, so setting it leaves the slot's
+// own state and D_max alone.
+inline void set_item(Entry& e, uint8_t fp, void* val) {
+    e.word = (e.word & ~ITEM_MASK) | OCC_BIT | encode_pointer(val) |
+             (static_cast<uint64_t>(fp) << FP_SHIFT);
+}
+
+// Place an item in slot `dst`, in the slot `bit` names in its home's mask. The
+// destination's state belongs to whatever already owns items here and is left
+// alone; the slot is marked occupied. The caller knows the bit: it is placing
+// at the home, the +1 neighbour, or the -1 neighbour.
+inline void* write_slot(Entry& dst, Entry& home_slot, uint8_t bit, uint8_t fp, void* val) {
+    set_state(home_slot, static_cast<uint8_t>(get_state(home_slot) | bit));
+
+    set_item(dst, fp, val);
     return val;
 }
 
-// Move src into dst with a new state, clearing src's occupancy but keeping its
-// D_max bound. The fingerprint and pointer travel; the key does not move.
-inline void shift_entry(Entry& src, Entry& dst, uint8_t new_state) {
-    uint64_t dmax = dst.word & (DMAX_MASK << DMAX_SHIFT);
-    dst.word = (src.word & (PTR_MASK | (FP_MASK << FP_SHIFT))) | dmax |
-               (static_cast<uint64_t>(new_state) << STATE_SHIFT);
-    src.word &= ~(STATE_MASK << STATE_SHIFT);
+// Move the item in src to dst. Bits [56..0] -- pointer, occupied, fingerprint --
+// travel whole; dst keeps its own state and D_max; src is left free.
+inline void shift_entry(Entry& src, Entry& dst) {
+    dst.word = (dst.word & ~ITEM_MASK) | (src.word & ITEM_MASK);
+    src.word &= ~ITEM_MASK;
 }
 
 // The pointer in a slot is the record's key, so the key bytes sit right at it
-// and the header one load behind.
+// and the header one load behind. Callers gate on the home's mask, so the slot
+// is known occupied; a mask bit exists iff the named slot holds an item.
 inline bool slot_holds_fp_8(const Entry& e, uint64_t key_val, uint8_t fp) {
-    if (get_state(e) == ST_EMPTY) return false;
     if (get_fingerprint(e) != fp) return false;
     const auto* k = static_cast<const unsigned char*>(decode_pointer(e.word));
     uint64_t packed;
@@ -249,7 +294,6 @@ inline bool slot_holds_fp_8(const Entry& e, uint64_t key_val, uint8_t fp) {
 }
 
 inline bool slot_holds_fp(const Entry& e, const void* key, std::size_t len, uint8_t fp) {
-    if (get_state(e) == ST_EMPTY) return false;
     if (get_fingerprint(e) != fp) return false;
     const auto* k = static_cast<const unsigned char*>(decode_pointer(e.word));
     // A stored key of another length can never equal the probe, so compare the
@@ -261,10 +305,10 @@ inline bool slot_holds_fp(const Entry& e, const void* key, std::size_t len, uint
 }
 
 // A T2 tombstone keeps the erased key's fingerprint and pointer, so it would
-// match the shared predicate. EMPTY (0) and TOMBSTONE (1) are both dead, so one
-// compare against 2 rejects both.
+// match the shared predicate. T2 slots hold only EMPTY (0), LIVE (1) or
+// TOMBSTONE (4), so one compare against live rejects both dead cases.
 inline bool t2_holds_fp_8(const Entry& e, uint64_t key_val, uint8_t fp) {
-    if (static_cast<uint8_t>(e.word >> STATE_SHIFT) < 2) return false;
+    if (get_state(e) != T2_LIVE) return false;
     if (get_fingerprint(e) != fp) return false;
     const auto* k = static_cast<const unsigned char*>(decode_pointer(e.word));
     uint64_t packed;
@@ -274,7 +318,7 @@ inline bool t2_holds_fp_8(const Entry& e, uint64_t key_val, uint8_t fp) {
 }
 
 inline bool t2_holds_fp(const Entry& e, const void* key, std::size_t len, uint8_t fp) {
-    if (static_cast<uint8_t>(e.word >> STATE_SHIFT) < 2) return false;
+    if (get_state(e) != T2_LIVE) return false;
     if (get_fingerprint(e) != fp) return false;
     const auto* k = static_cast<const unsigned char*>(decode_pointer(e.word));
     uint64_t packed;
@@ -531,16 +575,21 @@ public:
     Entry* slot_for_key(const void* key, std::size_t key_len, uint64_t hh, uint8_t fp,
                         bool& in_t1) {
         Entry& home = t1_[hh & mask1_];
-        if (get_state(home) == ST_OFF_ZERO && slot_holds_fp(home, key, key_len, fp)) {
+        const uint8_t s_home = get_state(home);
+        if ((s_home & MASK_SELF) && slot_holds_fp(home, key, key_len, fp)) {
             in_t1 = true;
             return &home;
         }
 
-        const int first = +1;
-        Entry& n1 = t1_[(hh + static_cast<uint64_t>(first)) & mask1_];
-        if (slot_holds_fp(n1, key, key_len, fp)) { in_t1 = true; return &n1; }
-        Entry& n2 = t1_[(hh + static_cast<uint64_t>(-first)) & mask1_];
-        if (slot_holds_fp(n2, key, key_len, fp)) { in_t1 = true; return &n2; }
+        // A neighbour can only hold this key if home's mask says so.
+        if (s_home & MASK_PLUS) {
+            Entry& n1 = t1_[(hh + 1) & mask1_];
+            if (slot_holds_fp(n1, key, key_len, fp)) { in_t1 = true; return &n1; }
+        }
+        if (s_home & MASK_MINUS) {
+            Entry& n2 = t1_[(hh - 1) & mask1_];
+            if (slot_holds_fp(n2, key, key_len, fp)) { in_t1 = true; return &n2; }
+        }
 
         uint8_t max_offset = get_t2_max_offset(home);
         if (max_offset == 0) return nullptr;
@@ -560,7 +609,7 @@ public:
         if (max_offset == DMAX_SENTINEL) {
             for (uint64_t off = max_offset; off < n2_; ++off) {
                 Entry& e = t2_[(base_t2 + off) & mask2_];
-                if (get_state(e) == ST_EMPTY) break;
+                if (get_state(e) == T2_EMPTY) break;
                 if (t2_holds_fp(e, key, key_len, fp)) return &e;
             }
         }
@@ -578,7 +627,7 @@ public:
         if (max_offset == DMAX_SENTINEL) {
             for (uint64_t off = max_offset; off < n2_; ++off) {
                 Entry& e = t2_[(base_t2 + off) & mask2_];
-                if (get_state(e) == ST_EMPTY) break;
+                if (get_state(e) == T2_EMPTY) break;
                 if (t2_holds_fp_8(e, key_val, fp)) return &e;
             }
         }
@@ -588,24 +637,25 @@ public:
     void* insert_place(const void* key, std::size_t key_len, uint64_t hh, void* val,
                        bool check_existing) {
         const uint8_t fp = fingerprint_of_hash(hh);
-        Entry& home = t1_[hh & mask1_];
-        Entry& right = t1_[(hh + 1) & mask1_];
-        Entry& left = t1_[(hh - 1) & mask1_];
+        const uint64_t home_idx = hh & mask1_;
+        const uint64_t right_idx = (hh + 1) & mask1_;
+        const uint64_t left_idx = (hh - 1) & mask1_;
+        Entry& home = t1_[home_idx];
+        Entry& right = t1_[right_idx];
+        Entry& left = t1_[left_idx];
         const uint8_t s_home = get_state(home);
-        const uint8_t s_right = get_state(right);
-        const uint8_t s_left = get_state(left);
 
         if (check_existing) {
             // pull_neighbors_home never leaves an offset entry when home is empty.
             Entry* hit = nullptr;
-            if (s_home == ST_EMPTY) {
+            if (!is_occupied(home)) {
                 goto check_t2;
             }
-            if (s_home == ST_OFF_ZERO && slot_holds_fp(home, key, key_len, fp)) {
+            if ((s_home & MASK_SELF) && slot_holds_fp(home, key, key_len, fp)) {
                 hit = &home;
-            } else if (slot_holds_fp(right, key, key_len, fp)) {
+            } else if ((s_home & MASK_PLUS) && slot_holds_fp(right, key, key_len, fp)) {
                 hit = &right;
-            } else if (slot_holds_fp(left, key, key_len, fp)) {
+            } else if ((s_home & MASK_MINUS) && slot_holds_fp(left, key, key_len, fp)) {
                 hit = &left;
             } else {
             check_t2:
@@ -620,40 +670,46 @@ public:
             }
         }
 
-        if (s_home == ST_EMPTY) {
-            return write_slot(home, fp, val, ST_OFF_ZERO);
+        if (!is_occupied(home)) {
+            return write_slot(home, home, MASK_SELF, fp, val);
         }
 
-        if (s_right == ST_EMPTY) {
-            return write_slot(right, fp, val, ST_OFF_POS);
+        if (!is_occupied(right)) {
+            return write_slot(right, home, MASK_PLUS, fp, val);
         }
-        if (s_left == ST_EMPTY) {
-            return write_slot(left, fp, val, ST_OFF_NEG);
+        if (!is_occupied(left)) {
+            return write_slot(left, home, MASK_MINUS, fp, val);
         }
 
         // 3. Both neighbors taken: open h+1 by shifting the entry there into
-        //    h+2, if that entry can still reach its own home from h+2. An entry
-        //    at home+1 cannot move further out. The new key then takes h+1 at
-        //    offset +1 -- the slot the probe checks first.
-        //
-        //    Only an entry at offset 0 can be pushed: one offset left can't
-        //    be pushed left, and offset right means it was pushed by something at the left.
-        if (s_right == ST_OFF_ZERO) {
+        //    h+2, if that entry sits at its own home. An entry homed at h-1
+        //    (named by home's MASK_PLUS) cannot go further out, and an entry
+        //    already pushed cannot move again. Only an entry at offset 0 can
+        //    be pushed, and it lands at offset +1 of its own home -- still
+        //    inside its window. The new key then takes h+1 at offset +1, the
+        //    slot the probe checks first.
+        if (is_occupied(right) && (get_state(right) & MASK_SELF)) {
             const uint64_t far_right = (hh + 2) & mask1_;
             Entry& next_right = t1_[far_right];
-            if (get_state(next_right) == ST_EMPTY) {
-                shift_entry(right, next_right, ST_OFF_POS);
-                return write_slot(right, fp, val, ST_OFF_POS);
+            if (!is_occupied(next_right)) {
+                // right is homed at right_idx: its mask bit moves self -> plus.
+                const uint8_t rs = get_state(right);
+                set_state(right, (rs & ~MASK_SELF) | MASK_PLUS);
+                shift_entry(right, next_right);
+                return write_slot(right, home, MASK_PLUS, fp, val);
             }
         }
 
-        // 4. Mirror on the left: same reasoning, offset 0 only.
-        if (s_left == ST_OFF_ZERO) {
+        // 4. Mirror on the left: same reasoning.
+        if (is_occupied(left) && (get_state(left) & MASK_SELF)) {
             const uint64_t far_left = (hh - 2) & mask1_;
             Entry& next_left = t1_[far_left];
-            if (get_state(next_left) == ST_EMPTY) {
-                shift_entry(left, next_left, ST_OFF_NEG);
-                return write_slot(left, fp, val, ST_OFF_NEG);
+            if (!is_occupied(next_left)) {
+                // left is its own home; its mask bit moves self -> minus.
+                const uint8_t ls = get_state(left);
+                set_state(left, (ls & ~MASK_SELF) | MASK_MINUS);
+                shift_entry(left, next_left);
+                return write_slot(left, home, MASK_MINUS, fp, val);
             }
         }
 
@@ -661,24 +717,25 @@ public:
     }
     void* insert_place_8(uint64_t key_val, uint64_t hh, void* val, bool check_existing) {
         const uint8_t fp = fingerprint_of_hash(hh);
-        Entry& home = t1_[hh & mask1_];
-        Entry& right = t1_[(hh + 1) & mask1_];
-        Entry& left = t1_[(hh - 1) & mask1_];
+        const uint64_t home_idx = hh & mask1_;
+        const uint64_t right_idx = (hh + 1) & mask1_;
+        const uint64_t left_idx = (hh - 1) & mask1_;
+        Entry& home = t1_[home_idx];
+        Entry& right = t1_[right_idx];
+        Entry& left = t1_[left_idx];
         const uint8_t s_home = get_state(home);
-        const uint8_t s_right = get_state(right);
-        const uint8_t s_left = get_state(left);
 
         if (check_existing) {
             // Same as insert_place.
             Entry* hit = nullptr;
-            if (s_home == ST_EMPTY) {
+            if (!is_occupied(home)) {
                 goto check_t2;
             }
-            if (s_home == ST_OFF_ZERO && slot_holds_fp_8(home, key_val, fp)) {
+            if ((s_home & MASK_SELF) && slot_holds_fp_8(home, key_val, fp)) {
                 hit = &home;
-            } else if (slot_holds_fp_8(right, key_val, fp)) {
+            } else if ((s_home & MASK_PLUS) && slot_holds_fp_8(right, key_val, fp)) {
                 hit = &right;
-            } else if (slot_holds_fp_8(left, key_val, fp)) {
+            } else if ((s_home & MASK_MINUS) && slot_holds_fp_8(left, key_val, fp)) {
                 hit = &left;
             } else {
             check_t2:
@@ -693,29 +750,33 @@ public:
             }
         }
 
-        if (s_home == ST_EMPTY) {
-            return write_slot(home, fp, val, ST_OFF_ZERO);
+        if (!is_occupied(home)) {
+            return write_slot(home, home, MASK_SELF, fp, val);
         }
-        if (s_right == ST_EMPTY) {
-            return write_slot(right, fp, val, ST_OFF_POS);
+        if (!is_occupied(right)) {
+            return write_slot(right, home, MASK_PLUS, fp, val);
         }
-        if (s_left == ST_EMPTY) {
-            return write_slot(left, fp, val, ST_OFF_NEG);
+        if (!is_occupied(left)) {
+            return write_slot(left, home, MASK_MINUS, fp, val);
         }
-        if (s_right == ST_OFF_ZERO) {
+        if (is_occupied(right) && (get_state(right) & MASK_SELF)) {
             const uint64_t far_right = (hh + 2) & mask1_;
             Entry& next_right = t1_[far_right];
-            if (get_state(next_right) == ST_EMPTY) {
-                shift_entry(right, next_right, ST_OFF_POS);
-                return write_slot(right, fp, val, ST_OFF_POS);
+            if (!is_occupied(next_right)) {
+                const uint8_t rs = get_state(right);
+                set_state(right, (rs & ~MASK_SELF) | MASK_PLUS);
+                shift_entry(right, next_right);
+                return write_slot(right, home, MASK_PLUS, fp, val);
             }
         }
-        if (s_left == ST_OFF_ZERO) {
+        if (is_occupied(left) && (get_state(left) & MASK_SELF)) {
             const uint64_t far_left = (hh - 2) & mask1_;
             Entry& next_left = t1_[far_left];
-            if (get_state(next_left) == ST_EMPTY) {
-                shift_entry(left, next_left, ST_OFF_NEG);
-                return write_slot(left, fp, val, ST_OFF_NEG);
+            if (!is_occupied(next_left)) {
+                const uint8_t ls = get_state(left);
+                set_state(left, (ls & ~MASK_SELF) | MASK_MINUS);
+                shift_entry(left, next_left);
+                return write_slot(left, home, MASK_MINUS, fp, val);
             }
         }
         return insert_into_T2(hh, val);
@@ -766,16 +827,20 @@ public:
         const uint64_t hh = hash_key(key_val);
         const uint8_t fp = fingerprint_of_hash(hh);
         const Entry& home = t1_[hh & mask1_];
+        const uint8_t s_home = get_state(home);
 
-        if (get_state(home) == ST_OFF_ZERO && slot_holds_fp_8(home, key_val, fp)) {
+        if ((s_home & MASK_SELF) && slot_holds_fp_8(home, key_val, fp)) {
             return decode_pointer(home.word);
         }
 
-        const int first = +1;
-        const Entry& n1 = t1_[(hh + (uint64_t)first) & mask1_];
-        if (slot_holds_fp_8(n1, key_val, fp)) return decode_pointer(n1.word);
-        const Entry& n2 = t1_[(hh + (uint64_t)-first) & mask1_];
-        if (slot_holds_fp_8(n2, key_val, fp)) return decode_pointer(n2.word);
+        if (s_home & MASK_PLUS) {
+            const Entry& n1 = t1_[(hh + 1) & mask1_];
+            if (slot_holds_fp_8(n1, key_val, fp)) return decode_pointer(n1.word);
+        }
+        if (s_home & MASK_MINUS) {
+            const Entry& n2 = t1_[(hh - 1) & mask1_];
+            if (slot_holds_fp_8(n2, key_val, fp)) return decode_pointer(n2.word);
+        }
 
         uint8_t max_offset = get_t2_max_offset(home);
         if (max_offset == 0) return nullptr;
@@ -793,7 +858,7 @@ public:
         if (max_offset == DMAX_SENTINEL) {
             for (uint64_t off = max_offset; off < n2_; ++off) {
                 const Entry& e = t2_[(base_t2 + off) & mask2_];
-                if (get_state(e) == ST_EMPTY) break;
+                if (get_state(e) == T2_EMPTY) break;
                 if (t2_holds_fp_8(e, key_val, fp)) return decode_pointer(e.word);
             }
         }
@@ -804,19 +869,23 @@ public:
         const uint64_t hh = hash_(key, key_len);
         const uint8_t fp = fingerprint_of_hash(hh);
         const Entry& home = t1_[hh & mask1_];
+        const uint8_t s_home = get_state(home);
 
-        if (get_state(home) == ST_OFF_ZERO && slot_holds_fp(home, key, key_len, fp)) {
+        if ((s_home & MASK_SELF) && slot_holds_fp(home, key, key_len, fp)) {
             return decode_pointer(home.word);
         }
 
-        const int first = +1;
-        const Entry& n1 = t1_[(hh + (uint64_t)first) & mask1_];
-        if (slot_holds_fp(n1, key, key_len, fp)) {
-            return decode_pointer(n1.word);
+        if (s_home & MASK_PLUS) {
+            const Entry& n1 = t1_[(hh + 1) & mask1_];
+            if (slot_holds_fp(n1, key, key_len, fp)) {
+                return decode_pointer(n1.word);
+            }
         }
-        const Entry& n2 = t1_[(hh + (uint64_t)-first) & mask1_];
-        if (slot_holds_fp(n2, key, key_len, fp)) {
-            return decode_pointer(n2.word);
+        if (s_home & MASK_MINUS) {
+            const Entry& n2 = t1_[(hh - 1) & mask1_];
+            if (slot_holds_fp(n2, key, key_len, fp)) {
+                return decode_pointer(n2.word);
+            }
         }
 
         uint8_t max_offset = get_t2_max_offset(home);
@@ -971,7 +1040,7 @@ private:
         if (max_offset == DMAX_SENTINEL) {
             for (uint64_t off = max_offset; off < n2_; ++off) {
                 const Entry& e = t2_[(base_t2 + off) & mask2_];
-                if (get_state(e) == ST_EMPTY) break;
+                if (get_state(e) == T2_EMPTY) break;
                 if (t2_holds_fp(e, key, key_len, fp)) return decode_pointer(e.word);
             }
         }
@@ -982,6 +1051,7 @@ public:
     bool erase(uint64_t key) { return erase_key(&key, sizeof key); }
     bool erase(std::string_view key) { return erase_key(key.data(), key.size()); }
     bool erase(const void* key, std::size_t key_len) { return erase_key(key, key_len); }
+
 
 private:
     bool erase_key(const void* key, std::size_t key_len) {
@@ -995,11 +1065,19 @@ private:
         key_store_.mark_dead(decode_pointer(e->word));
         ++deleted_;
         if (in_t1) {
-            e->word &= ~(STATE_MASK << STATE_SHIFT);
+            // The slot's state belongs to its own home; only the item bits go.
+            e->word &= ~ITEM_MASK;
+            // Its home's mask still names this slot. Clear that bit, then let a
+            // neighbouring item homed at the freed slot move in.
+            Entry& home = t1_[hh & mask1_];
+            const uint64_t home_i = hh & mask1_;
+            const uint8_t bit = mask_bit_for(static_cast<uint64_t>(e - t1_), home_i, mask1_);
+            home.word &= ~(static_cast<uint64_t>(bit) << STATE_SHIFT);
             pull_neighbors_home(static_cast<uint64_t>(e - t1_));
         } else {
-            e->word &= ~(STATE_MASK << STATE_SHIFT);
-            e->word |= static_cast<uint64_t>(ST_TOMBSTONE) << STATE_SHIFT;
+            // T2 slots carry no mask; the three state bits hold only the marker,
+            // so replace them wholesale and leave the item bits for reuse.
+            set_state(*e, T2_TOMBSTONE);
             --t2_count_;
         }
         return true;
@@ -1021,10 +1099,15 @@ private:
             bool moved = false;
             for (int dir = -1; dir <= 1; dir += 2) {
                 uint64_t from = (gap + (uint64_t)dir) & mask1_;
-                const Entry& src = t1_[from];
-                uint8_t st = get_state(src);
-                if (st != (dir < 0 ? ST_OFF_NEG : ST_OFF_POS)) continue;
-                shift_entry(t1_[from], t1_[gap], ST_OFF_ZERO);
+                // An item in `from` homed at `gap` is one step from its home;
+                // `gap`'s mask says so, and the item itself is in the neighbour.
+                const uint8_t bit = (dir < 0) ? MASK_MINUS : MASK_PLUS;
+                const uint8_t gs = get_state(t1_[gap]);
+                if (!(gs & bit)) continue;
+                // Move the item in. Its home is `gap`, so the mask bit travels
+                // from the far side to MASK_SELF in that same home word.
+                shift_entry(t1_[from], t1_[gap]);
+                set_state(t1_[gap], (gs & ~bit) | MASK_SELF);
                 gap = from;
                 moved = true;
                 break;
@@ -1045,14 +1128,20 @@ private:
         for (uint64_t off = 0; off < n2_; ++off) {
             uint64_t idx = (base_t2 + off) & mask2_;
             uint8_t st = get_state(t2_[idx]);
-            if (st == ST_EMPTY || st == ST_TOMBSTONE) {
+            if (st != T2_LIVE) {
                 ++t2_count_;
                 Entry& d_home = t1_[hh & mask1_];
 
                 // Stored as offset + 1, so offset 0 is not "nothing spilled".
                 const uint8_t dmax = std::min<uint8_t>(off + 1, DMAX_SENTINEL);
                 set_t2_max_offset(d_home, std::max(get_t2_max_offset(d_home), dmax));
-                return write_slot(t2_[idx], fingerprint_of_hash(hh), val, ST_OFF_ZERO);
+                // A T2 slot belongs to no T1 home, so no mask bit is set; its
+                // state is the marker alone, so replace the field rather than
+                // OR into it (a tombstone is 100, live is 001).
+                Entry& d = t2_[idx];
+                set_state(d, T2_LIVE);
+                set_item(d, fingerprint_of_hash(hh), val);
+                return val;
             }
         }
         return nullptr;
@@ -1080,7 +1169,7 @@ private:
         // neighbourhoods sparse, so fewer entries spill.
         for (std::size_t i = 0; i < old_n1; ++i) {
             const Entry& e = old_t1[i];
-            if (get_state(e) == ST_EMPTY) continue;
+            if (!is_occupied(e)) continue;
             void* val = decode_pointer(e.word);
             std::size_t klen = key_len_at(val);
             const void* k = val;
@@ -1091,7 +1180,7 @@ private:
         for (std::size_t i = 0; i < old_n2; ++i) {
             const Entry& e = old_t2[i];
             uint8_t st = get_state(e);
-            if (st == ST_EMPTY || st == ST_TOMBSTONE) continue;
+            if (st != T2_LIVE) continue;
             void* val = decode_pointer(e.word);
             std::size_t klen = key_len_at(val);
             const void* k = val;
