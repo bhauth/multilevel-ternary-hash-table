@@ -466,7 +466,7 @@ static void suite_mtht(std::size_t n1_shift, std::size_t t2_div, std::size_t ins
 
     out::line("== mtht ==");
     out::line("  N1=%zu N2=%zu (t2=t1/%zu) keys/case=%zu value=8B RAW keys", N1, N2, t2_div, nkeys);
-    out::line("  %-11s %9s %11s %9s %-9s", "case", "ins_ms", "find_ms", "Mfind/s", "t1/t2 load");
+    out::line("  %-11s %9s %11s %9s %11s %9s", "case", "ins_ms", "find_ms", "Mfind/s", "miss_ms", "Mmiss/s");
     out::line("  %s", std::string(96, '-').c_str());
 
     for (Dist& d : distributions(nkeys)) {
@@ -493,10 +493,27 @@ static void suite_mtht(std::size_t n1_shift, std::size_t t2_div, std::size_t ins
         const double t_find = best;
         (void)sink;
 
+        // Missed finds: keys that are in no table. Every probe walks the whole
+        // path -- home, both neighbours the mask names, then T2 to max_offset --
+        // so this is the column that shows what the masks can save.
+        Keys misses = gen_absent(nkeys, 0x5EEDULL + (uint64_t)d.keys.size());
+        volatile uint64_t sink2 = 0;
+        double best_miss = 1e18;
+        for (int r = 0; r < REPS; ++r) {
+            auto t1 = Clock::now();
+            for (uint64_t k : misses)
+                if (t.find(k)) ++sink2; // must never fire
+            const double dd = ms_since(t1);
+            if (dd < best_miss) best_miss = dd;
+        }
+        const double t_miss = best_miss;
+        (void)sink2;
+
         char loads[40];
         std::snprintf(loads, sizeof loads, "%.3f/%.3f", t.load1(), t.load2());
-        out::line("  %-11s %9.2f %11.2f %9.1f %-9s",
-                  d.name, t_ins, t_find, (double)nkeys / t_find, loads);
+        out::line("  %-11s %9.2f %11.2f %9.1f %11.2f %9.1f %-9s",
+                  d.name, t_ins, t_find, (double)nkeys / t_find,
+                  t_miss, (double)nkeys / t_miss, loads);
         if (inserted != nkeys) out::line("     !! inserted %zu/%zu", inserted, nkeys);
     }
     out::line("");
