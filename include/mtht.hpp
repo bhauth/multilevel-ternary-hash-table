@@ -691,7 +691,7 @@ public:
         //    be pushed, and it lands at offset +1 of its own home -- still
         //    inside its window. The new key then takes h+1 at offset +1, the
         //    slot the probe checks first.
-        if (is_occupied(right) && (get_state(right) & MASK_SELF)) {
+        if (get_state(right) & MASK_SELF) {
             const uint64_t far_right = (hh + 2) & mask1_;
             Entry& next_right = t1_[far_right];
             if (!is_occupied(next_right)) {
@@ -704,14 +704,23 @@ public:
         }
 
         // 4. Mirror on the left: same reasoning.
-        if (is_occupied(left) && (get_state(left) & MASK_SELF)) {
+        const uint8_t s_left = get_state(left);
+        if (s_left & MASK_SELF) {
             const uint64_t far_left = (hh - 2) & mask1_;
             Entry& next_left = t1_[far_left];
             if (!is_occupied(next_left)) {
+                // If left also names an item at h, that item is homed at left
+                // and h-2 is offset -1 of its home: move it instead, and the
+                // new key takes h at offset 0 rather than h-1. Otherwise the
+                // item homed at left moves and the new key takes h-1.
+                const bool plus = s_left & MASK_PLUS;
+                shift_entry(plus ? home : left, next_left);
+                if (plus) {
+                    set_state(left, (s_left & ~MASK_PLUS) | MASK_MINUS);
+                    return write_slot(home, home, MASK_SELF, fp, val);
+                }
                 // left is its own home; its mask bit moves self -> minus.
-                const uint8_t ls = get_state(left);
-                set_state(left, (ls & ~MASK_SELF) | MASK_MINUS);
-                shift_entry(left, next_left);
+                set_state(left, (s_left & ~MASK_SELF) | MASK_MINUS);
                 return write_slot(left, home, MASK_MINUS, fp, val);
             }
         }
@@ -766,7 +775,7 @@ public:
         if (!is_occupied(left)) {
             return write_slot(left, home, MASK_MINUS, fp, val);
         }
-        if (is_occupied(right) && (get_state(right) & MASK_SELF)) {
+        if (get_state(right) & MASK_SELF) {
             const uint64_t far_right = (hh + 2) & mask1_;
             Entry& next_right = t1_[far_right];
             if (!is_occupied(next_right)) {
@@ -776,13 +785,19 @@ public:
                 return write_slot(right, home, MASK_PLUS, fp, val);
             }
         }
-        if (is_occupied(left) && (get_state(left) & MASK_SELF)) {
+        const uint8_t s_left = get_state(left);
+        if (s_left & MASK_SELF) {
             const uint64_t far_left = (hh - 2) & mask1_;
             Entry& next_left = t1_[far_left];
             if (!is_occupied(next_left)) {
-                const uint8_t ls = get_state(left);
-                set_state(left, (ls & ~MASK_SELF) | MASK_MINUS);
-                shift_entry(left, next_left);
+                // Same as insert_place: an item at h homed at left moves to h-2.
+                const bool plus = s_left & MASK_PLUS;
+                shift_entry(plus ? home : left, next_left);
+                if (plus) {
+                    set_state(left, (s_left & ~MASK_PLUS) | MASK_MINUS);
+                    return write_slot(home, home, MASK_SELF, fp, val);
+                }
+                set_state(left, (s_left & ~MASK_SELF) | MASK_MINUS);
                 return write_slot(left, home, MASK_MINUS, fp, val);
             }
         }
