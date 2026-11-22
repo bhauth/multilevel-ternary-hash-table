@@ -268,7 +268,7 @@ inline void set_item(Entry& e, uint8_t fp, void* val) {
 // alone; the slot is marked occupied. The caller knows the bit: it is placing
 // at the home, the +1 neighbour, or the -1 neighbour.
 inline void* write_slot(Entry& dst, Entry& home_slot, uint8_t bit, uint8_t fp, void* val) {
-    set_state(home_slot, static_cast<uint8_t>(get_state(home_slot) | bit));
+    home_slot.word |= static_cast<uint64_t>(bit) << STATE_SHIFT;
 
     set_item(dst, fp, val);
     return val;
@@ -637,20 +637,20 @@ public:
     void* insert_place(const void* key, std::size_t key_len, uint64_t hh, void* val,
                        bool check_existing) {
         const uint8_t fp = fingerprint_of_hash(hh);
-        const uint64_t home_idx = hh & mask1_;
-        const uint64_t right_idx = (hh + 1) & mask1_;
-        const uint64_t left_idx = (hh - 1) & mask1_;
-        Entry& home = t1_[home_idx];
-        Entry& right = t1_[right_idx];
-        Entry& left = t1_[left_idx];
+        Entry& home = t1_[hh & mask1_];
+        Entry& right = t1_[(hh + 1) & mask1_];
+        Entry& left = t1_[(hh - 1) & mask1_];
+        
+        {
         const uint8_t s_home = get_state(home);
+        Entry* hit = nullptr;
+
+        if (!is_occupied(home) && !get_t2_max_offset(home)) {
+            return write_slot(home, home, MASK_SELF, fp, val);
+        }
 
         if (check_existing) {
             // pull_neighbors_home never leaves an offset entry when home is empty.
-            Entry* hit = nullptr;
-            if (!is_occupied(home)) {
-                goto check_t2;
-            }
             if ((s_home & MASK_SELF) && slot_holds_fp(home, key, key_len, fp)) {
                 hit = &home;
             } else if ((s_home & MASK_PLUS) && slot_holds_fp(right, key, key_len, fp)) {
@@ -658,9 +658,10 @@ public:
             } else if ((s_home & MASK_MINUS) && slot_holds_fp(left, key, key_len, fp)) {
                 hit = &left;
             } else {
-            check_t2:
                 const uint8_t max_offset = get_t2_max_offset(home);
-                if (max_offset) hit = slot_for_key_T2(hh, key, key_len, fp, max_offset);
+                if (max_offset) {
+                    hit = slot_for_key_T2(hh, key, key_len, fp, max_offset);
+                } else { goto check_sides; }
             }
             if (hit) {
                 key_store_.mark_dead(decode_pointer(hit->word));
@@ -668,12 +669,14 @@ public:
                 hit->word = (hit->word & ~PTR_MASK) | encode_pointer(val);
                 return val;
             }
+            
+            if (!is_occupied(home)) {
+                return write_slot(home, home, MASK_SELF, fp, val);
+            }
+        }
         }
 
-        if (!is_occupied(home)) {
-            return write_slot(home, home, MASK_SELF, fp, val);
-        }
-
+    check_sides:
         if (!is_occupied(right)) {
             return write_slot(right, home, MASK_PLUS, fp, val);
         }
@@ -717,20 +720,20 @@ public:
     }
     void* insert_place_8(uint64_t key_val, uint64_t hh, void* val, bool check_existing) {
         const uint8_t fp = fingerprint_of_hash(hh);
-        const uint64_t home_idx = hh & mask1_;
-        const uint64_t right_idx = (hh + 1) & mask1_;
-        const uint64_t left_idx = (hh - 1) & mask1_;
-        Entry& home = t1_[home_idx];
-        Entry& right = t1_[right_idx];
-        Entry& left = t1_[left_idx];
+        Entry& home = t1_[hh & mask1_];
+        Entry& right = t1_[(hh + 1) & mask1_];
+        Entry& left = t1_[(hh - 1) & mask1_];
+
+        {
         const uint8_t s_home = get_state(home);
+        Entry* hit = nullptr;
+
+        if (!is_occupied(home) && !get_t2_max_offset(home)) {
+            return write_slot(home, home, MASK_SELF, fp, val);
+        }
 
         if (check_existing) {
             // Same as insert_place.
-            Entry* hit = nullptr;
-            if (!is_occupied(home)) {
-                goto check_t2;
-            }
             if ((s_home & MASK_SELF) && slot_holds_fp_8(home, key_val, fp)) {
                 hit = &home;
             } else if ((s_home & MASK_PLUS) && slot_holds_fp_8(right, key_val, fp)) {
@@ -738,9 +741,10 @@ public:
             } else if ((s_home & MASK_MINUS) && slot_holds_fp_8(left, key_val, fp)) {
                 hit = &left;
             } else {
-            check_t2:
                 const uint8_t max_offset = get_t2_max_offset(home);
-                if (max_offset) hit = slot_for_key_T2_8(hh, key_val, fp, max_offset);
+                if (max_offset) {
+                    hit = slot_for_key_T2_8(hh, key_val, fp, max_offset);
+                } else { goto check_sides; }
             }
             if (hit) {
                 key_store_.mark_dead(decode_pointer(hit->word));
@@ -748,11 +752,14 @@ public:
                 hit->word = (hit->word & ~PTR_MASK) | encode_pointer(val);
                 return val;
             }
+            
+            if (!is_occupied(home)) {
+                return write_slot(home, home, MASK_SELF, fp, val);
+            }
+        }
         }
 
-        if (!is_occupied(home)) {
-            return write_slot(home, home, MASK_SELF, fp, val);
-        }
+    check_sides:
         if (!is_occupied(right)) {
             return write_slot(right, home, MASK_PLUS, fp, val);
         }
