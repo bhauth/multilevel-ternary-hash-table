@@ -21,8 +21,49 @@ namespace mtht {
 struct alignas(8) Entry {
     uint64_t word;
 };
-
 static_assert(sizeof(Entry) == 8, "Entry must be 8 bytes");
+
+
+// memcmp replacement
+
+inline uint32_t load32(const char* p) {
+    uint32_t v;
+    std::memcpy(&v, p, sizeof(v)); // Compiles to a single unaligned mov on -O2
+    return v;
+}
+
+inline uint64_t load64(const char* p) {
+    uint64_t v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+inline bool fast_memeq(const char* a, const char* b, size_t len) {
+    if (len >= 8) {
+        const size_t end = len - 8;
+        uint64_t diff = 0;
+        size_t i = 0;
+        do {
+            diff |= load64(a + i) ^ load64(b + i);
+            i += 8;
+        } while (i < end);
+        diff |= load64(a + end) ^ load64(b + end);
+        return diff == 0;
+    }
+
+    if (len >= 4) {
+        return ((load32(a) ^ load32(b)) |
+                (load32(a + len - 4) ^ load32(b + len - 4))) == 0;
+    }
+
+    if (len >= 1) {
+        return ((a[0] ^ b[0]) |
+                (a[len >> 1] ^ b[len >> 1]) |
+                (a[len - 1] ^ b[len - 1])) == 0;
+    }
+
+    return true;
+}
 
 // A slot's word packs two kinds of thing. Bits [56..0] describe the item in
 // the slot -- where its record is, its fingerprint, and whether the slot is
@@ -301,7 +342,7 @@ inline bool slot_holds_fp(const Entry& e, const void* key, std::size_t len, uint
     uint64_t packed;
     std::memcpy(&packed, k - PL_HEAD_BYTES, sizeof packed);
     if (packed_key_len(packed) != len) return false;
-    return std::memcmp(k, key, len) == 0;
+    return fast_memeq(reinterpret_cast<const char*>(k), static_cast<const char*>(key), len);
 }
 
 // A T2 tombstone keeps the erased key's fingerprint and pointer, so it would
@@ -324,7 +365,7 @@ inline bool t2_holds_fp(const Entry& e, const void* key, std::size_t len, uint8_
     uint64_t packed;
     std::memcpy(&packed, k - PL_HEAD_BYTES, sizeof packed);
     if (packed_key_len(packed) != len) return false;
-    return std::memcmp(k, key, len) == 0;
+    return fast_memeq(reinterpret_cast<const char*>(k), static_cast<const char*>(key), len);
 }
 
 // Default hash policy, and the shape a custom one takes:
