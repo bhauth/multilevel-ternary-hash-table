@@ -10,7 +10,6 @@
 #include <cstring>
 #include <string_view>
 #include <string>
-#include <functional>
 #include <memory>
 #include <new>
 #include <type_traits>
@@ -278,14 +277,28 @@ inline uint8_t fingerprint_of_hash(uint64_t h) {
 }
 
 // handles len != 8 only
+//
+// The walk is fast_memeq's: overlapping 8-byte words, the last one anchored at
+// len-8, so a key costs ceil((len-7)/8) loads and never reads past its end.
 inline uint64_t hash_bytes(const void* p, std::size_t len) {
     if (len < 8) {
         uint64_t w = 0;
         std::memcpy(&w, p, len);
         return hash_key(w + (static_cast<uint64_t>(len) << 56));
     }
-    std::string_view sv(static_cast<const char*>(p), len);
-    return hash_key(static_cast<uint64_t>(std::hash<std::string_view>{}(sv)));
+    constexpr uint64_t M = 0xC2B2AE3D27D4EB4FULL;
+    const char* a = static_cast<const char*>(p);
+    const std::size_t end = len - 8;
+    uint64_t h = len;
+    std::size_t i = 0;
+    do {
+        h = (h ^ load64(a + i)) * M;
+        h ^= h >> 29;
+        i += 8;
+    } while (i < end);
+    h = (h ^ load64(a + end)) * M;
+    h ^= h >> 31;
+    return hash_key(h);
 }
 
 inline uint8_t get_fingerprint(const Entry& e) {
@@ -543,8 +556,7 @@ public:
         return insert_key_8(key, &value, sizeof value);
     }
     void* insert(std::string_view key, const void* bytes, std::size_t bytes_len) {
-        if (key.size() == 8) return insert_key_8(read_word(key.data()), bytes, bytes_len);
-        return insert_key(key.data(), key.size(), bytes, bytes_len);
+        return insert(key.data(), key.size(), bytes, bytes_len);
     }
     void* insert(const void* key, std::size_t key_len, const void* bytes,
                  std::size_t bytes_len) {
@@ -552,8 +564,7 @@ public:
         return insert_key(key, key_len, bytes, bytes_len);
     }
     void* insert(std::string_view key, const std::string& value) {
-        if (key.size() == 8) return insert_key_8_str(read_word(key.data()), value);
-        return insert_key_str(key.data(), key.size(), value);
+        return insert(key.data(), key.size(), value.data(), value.size());
     }
 
     void* insert_key(const void* key, std::size_t key_len, const void* bytes,
@@ -571,14 +582,6 @@ public:
         if (!rec) return nullptr;
 
         return insert_place_8(key_val, hh, rec, true);
-    }
-
-    void* insert_key_str(const void* key, std::size_t key_len, const std::string& value) {
-        return insert_key(key, key_len, value.data(), value.size());
-    }
-
-    void* insert_key_8_str(uint64_t key_val, const std::string& value) {
-        return insert_key_8(key_val, value.data(), value.size());
     }
 
     Entry* slot_for_key(const void* key, std::size_t key_len, uint64_t hh, uint8_t fp,
