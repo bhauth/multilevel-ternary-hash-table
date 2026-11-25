@@ -281,24 +281,38 @@ inline uint8_t fingerprint_of_hash(uint64_t h) {
 // The walk is fast_memeq's: overlapping 8-byte words, the last one anchored at
 // len-8, so a key costs ceil((len-7)/8) loads and never reads past its end.
 inline uint64_t hash_bytes(const void* p, std::size_t len) {
+    const char* a = static_cast<const char*>(p);
     if (len < 8) {
-        uint64_t w = 0;
-        std::memcpy(&w, p, len);
-        return hash_key(w + (static_cast<uint64_t>(len) << 56));
+        // fast_memeq's tiers: overlapping in-bounds loads, never past the key.
+        uint64_t w = len << 56;
+        if (len >= 4) {
+            const std::size_t tail = len - 4;
+            w ^= load32(a) ^ (static_cast<uint64_t>(load32(a + tail)) << 32);
+        } else if (len >= 1) {
+            w |= static_cast<unsigned char>(a[0])
+              | (static_cast<uint64_t>(static_cast<unsigned char>(a[len >> 1])) << 8)
+              | (static_cast<uint64_t>(static_cast<unsigned char>(a[len - 1])) << 16);
+        } else {
+            w = 0;
+        }
+        return hash_key(w);
     }
     constexpr uint64_t M = 0xC2B2AE3D27D4EB4FULL;
-    const char* a = static_cast<const char*>(p);
-    const std::size_t end = len - 8;
-    uint64_t h = len;
+    std::size_t end = len;
+    uint64_t h1 = len;
+    uint64_t h2 = end;
     std::size_t i = 0;
     do {
-        h = (h ^ load64(a + i)) * M;
-        h ^= h >> 29;
+        end -= 8;
+        h2 = (h2 >> 33) | (h2 << 31);  // 1-op rotate
+        h1 ^= load64(a + i);
+        h2 ^= load64(a + end);
+        h1 *= M;
+        h2 *= M;
+        h1 ^= h1 >> 29;
         i += 8;
     } while (i < end);
-    h = (h ^ load64(a + end)) * M;
-    h ^= h >> 31;
-    return hash_key(h);
+    return (h1 ^ h2) * M;
 }
 
 inline uint8_t get_fingerprint(const Entry& e) {
