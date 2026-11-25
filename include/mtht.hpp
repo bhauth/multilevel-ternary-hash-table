@@ -277,12 +277,8 @@ inline uint8_t fingerprint_of_hash(uint64_t h) {
     return static_cast<uint8_t>(h >> 54);
 }
 
+// handles len != 8 only
 inline uint64_t hash_bytes(const void* p, std::size_t len) {
-    if (len == 8) {
-        uint64_t w;
-        std::memcpy(&w, p, 8);
-        return hash_key(w);
-    }
     if (len < 8) {
         uint64_t w = 0;
         std::memcpy(&w, p, len);
@@ -355,18 +351,16 @@ inline bool slot_holds_fp(const Entry& e, const void* key, std::size_t len, uint
 //
 //     struct MyHash {
 //         uint64_t operator()(const void* p, std::size_t len) const; // key span of len bytes
-//         uint64_t operator()(const void* p) const;                  // 8-byte key
+//         uint64_t operator()(uint64_t key) const;                   // 8-byte key
 //     };
 //
-// The span form is only called with len != 8 -- an 8-byte key is routed to the
-// 8-byte form first -- so its length-8 case is free to differ.
+// The span form is only called with len != 8 -- an 8-byte key is read as a word
+// and routed to the word form first -- so hash_bytes does not handle len 8.
 struct Hash {
     uint64_t operator()(const void* p, std::size_t len) const {
         return hash_bytes(p, len);
     }
-    uint64_t operator()(const void* p) const {
-        return hash_key(read_word(p));
-    }
+    uint64_t operator()(uint64_t key) const { return hash_key(key); }
 };
 
 class KeyStore {
@@ -550,23 +544,23 @@ public:
     }
 
     void* insert(uint64_t key, const void* bytes, std::size_t bytes_len) {
-        return insert_key_8(&key, bytes, bytes_len);
+        return insert_key_8(key, bytes, bytes_len);
     }
     // An int-int record: 8-byte key, 8-byte value.
     void* insert(uint64_t key, uint64_t value) {
-        return insert_key_8(&key, &value, sizeof value);
+        return insert_key_8(key, &value, sizeof value);
     }
     void* insert(std::string_view key, const void* bytes, std::size_t bytes_len) {
-        if (key.size() == 8) return insert_key_8(key.data(), bytes, bytes_len);
+        if (key.size() == 8) return insert_key_8(read_word(key.data()), bytes, bytes_len);
         return insert_key(key.data(), key.size(), bytes, bytes_len);
     }
     void* insert(const void* key, std::size_t key_len, const void* bytes,
                  std::size_t bytes_len) {
-        if (key_len == 8) return insert_key_8(key, bytes, bytes_len);
+        if (key_len == 8) return insert_key_8(read_word(key), bytes, bytes_len);
         return insert_key(key, key_len, bytes, bytes_len);
     }
     void* insert(std::string_view key, const std::string& value) {
-        if (key.size() == 8) return insert_key_8_str(key.data(), value);
+        if (key.size() == 8) return insert_key_8_str(read_word(key.data()), value);
         return insert_key_str(key.data(), key.size(), value);
     }
 
@@ -578,11 +572,10 @@ public:
         const uint64_t hh = hash_(key, key_len);
         return insert_place(key, key_len, hh, rec, true);
     }
-    void* insert_key_8(const void* key, const void* bytes, std::size_t bytes_len) {
-        const uint64_t hh = hash_(key);
-        const uint64_t key_val = read_word(key);
+    void* insert_key_8(uint64_t key_val, const void* bytes, std::size_t bytes_len) {
+        const uint64_t hh = hash_(key_val);
 
-        void* rec = key_store_.store(key, 8, bytes, bytes_len);
+        void* rec = key_store_.store(&key_val, 8, bytes, bytes_len);
         if (!rec) return nullptr;
 
         return insert_place_8(key_val, hh, rec, true);
@@ -592,8 +585,8 @@ public:
         return insert_key(key, key_len, value.data(), value.size());
     }
 
-    void* insert_key_8_str(const void* key, const std::string& value) {
-        return insert_key_8(key, value.data(), value.size());
+    void* insert_key_8_str(uint64_t key_val, const std::string& value) {
+        return insert_key_8(key_val, value.data(), value.size());
     }
 
     Entry* slot_for_key(const void* key, std::size_t key_len, uint64_t hh, uint8_t fp,
@@ -1104,7 +1097,8 @@ public:
 
 private:
     bool erase_key(const void* key, std::size_t key_len) {
-        const uint64_t hh = hash_(key, key_len);
+        const uint64_t hh =
+            key_len == 8 ? hash_(read_word(key)) : hash_(key, key_len);
         const uint8_t fp = fingerprint_of_hash(hh);
 
         bool in_t1 = false;
