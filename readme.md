@@ -175,11 +175,11 @@ Reads/s and inserts/s. Sizes in bytes.
 
 | keys   | value    | MTHT               | robin        | udense        | umap         |
 |--------|----------|--------------------|--------------|---------------|--------------|
-| 4–24 B | 16–128 B | **58.0M / 16.4M**  | 33.7M / 8.7M | 38.8M / 10.1M | 23.3M / 6.5M |
-| 8 B    | 256 B    | **124.5M / 13.8M** | 60.6M / 5.6M | 66.5M / 5.8M  | 37.0M / 4.8M |
-| 256 B  | 8 B      | **11.3M / 8.1M**   | 5.5M / 3.9M  | 7.8M / 4.6M   | 6.2M / 2.8M  |
-| 64 B   | 64 B     | **39.2M / 11.4M**  | 16.4M / 5.4M | 23.0M / 5.9M  | 15.4M / 3.6M |
-| 256 B  | 256 B    | **7.8M / 5.7M**    | 5.3M / 2.6M  | 6.8M / 3.1M   | 5.3M / 2.1M  |
+| 4–24 B | 16–128 B | **67.5M / 18.6M**  | 37.4M / 11.7M | 43.4M / 11.7M | 25.3M / 7.2M |
+| 8 B    | 256 B    | **123.4M / 14.0M** | 53.2M / 5.8M  | 60.8M / 5.9M  | 34.8M / 4.9M |
+| 256 B  | 8 B      | **12.0M / 7.8M**   | 6.8M / 3.6M   | 8.1M / 4.4M   | 6.5M / 2.6M  |
+| 64 B   | 64 B     | **41.0M / 12.3M**  | 21.5M / 5.7M  | 26.3M / 6.3M  | 18.8M / 3.7M |
+| 256 B  | 256 B    | **8.4M / 5.6M**    | 5.7M / 2.5M   | 7.3M / 3.1M   | 5.7M / 2.1M  |
 
 Compared to udense, MTHT reads are 1.15–1.87x and inserts 1.62–2.38x the speed here, using 0.77–1.06x the memory.
 
@@ -187,11 +187,11 @@ Compared to udense, MTHT reads are 1.15–1.87x and inserts 1.62–2.38x the spe
 
 | keys   | value    | MTHT               | robin         | udense        | umap         |
 |--------|----------|--------------------|---------------|---------------|--------------|
-| 4–24 B | 16–128 B | **70.6M / 20.5M**  | 35.5M / 12.9M | 45.9M / 13.9M | 28.3M / 8.2M |
-| 8 B    | 256 B    | **189.6M / 21.7M** | 64.1M / 7.6M  | 87.3M / 7.4M  | 48.7M / 5.7M |
-| 256 B  | 8 B      | **24.2M / 14.2M**  | 15.9M / 5.4M  | 18.0M / 5.6M  | 14.4M / 3.7M |
-| 64 B   | 64 B     | **49.7M / 25.9M**  | 33.0M / 9.1M  | 44.8M / 9.8M  | 31.9M / 5.4M |
-| 256 B  | 256 B    | **21.9M / 9.0M**   | 15.6M / 3.8M  | 17.9M / 3.8M  | 14.2M / 2.7M |
+| 4–24 B | 16–128 B | **88.5M / 28.3M**  | 37.9M / 13.5M | 50.5M / 15.7M | 30.5M / 9.0M |
+| 8 B    | 256 B    | **191.2M / 16.6M** | 55.1M / 7.3M  | 77.1M / 7.5M  | 44.6M / 5.9M |
+| 256 B  | 8 B      | **19.4M / 12.8M**  | 12.9M / 4.9M  | 14.5M / 5.5M  | 11.6M / 3.4M |
+| 64 B   | 64 B     | **47.2M / 27.2M**  | 31.6M / 8.9M  | 43.9M / 10.0M | 29.7M / 5.4M |
+| 256 B  | 256 B    | **18.8M / 8.7M**   | 12.9M / 3.7M  | 14.6M / 3.7M  | 11.8M / 2.8M |
 
 Compared to udense, MTHT reads are 1.11–2.17x and inserts 1.47–2.93x the speed here, using 0.74–1.05x the memory.
 
@@ -220,27 +220,27 @@ Keys are mixed length: 70% at 1–16 B, 27% at 17–64 B, 3% at 65–256 B.
 
 |                         | reads/s   | inserts/s | bytes/key |
 |-------------------------|-----------|-----------|-----------|
-| MTHT                    | **33.7M** | 16.7M     | **58.4**  |
-| tsl::robin_map          | 18.8M     | 14.6M     | 85.3      |
-| ankerl::unordered_dense | 28.4M     | **18.1M** | 70.1      |
-| std::unordered_map      | 18.3M     | 7.8M      | 78.0      |
+| MTHT                    | **35.0M** | 18.2M     | **58.4**  |
+| tsl::robin_map          | 18.2M     | 14.0M     | 85.3      |
+| ankerl::unordered_dense | 27.3M     | **18.5M** | 70.1      |
+| std::unordered_map      | 16.3M     | 7.3M      | 78.0      |
 
 #### int keys
 
 |                         | reads/s    | inserts/s  | bytes/key |
 |-------------------------|------------|------------|-----------|
-| MTHT                    | 103.5M     | 46.9M      | 24.0      |
-| tsl::robin_map          | 81.9M      | 60.0M      | 32.0      |
-| ankerl::unordered_dense | **199.6M** | **106.3M** | **23.3**  |
-| std::unordered_map      | 119.2M     | 16.9M      | 42.7      |
+| MTHT                    | 103.0M     | 47.2M      | 24.0      |
+| tsl::robin_map          | 82.0M      | 60.6M      | 32.0      |
+| ankerl::unordered_dense | **199.9M** | **106.7M** | **23.3**  |
+| std::unordered_map      | 119.9M     | 17.0M      | 42.7      |
 
 #### load sweep (ints)
 
 | load  | reads/s | probes/read |
 |-------|---------|-------------|
-| 0.083 | 205.9M  | 1.04        |
-| 0.411 | 129.3M  | 1.25        |
-| 0.686 | 87.8M   | 1.54        |
+| 0.083 | 208.1M  | 1.04        |
+| 0.411 | 136.9M  | 1.25        |
+| 0.688 | 96.7M   | 1.54        |
 
 ### iteration
 
@@ -248,9 +248,9 @@ Iteration over every live key-value pair. String keys and string values.
 
 |                         | items/s  |
 |-------------------------|----------|
-| MTHT `iter()`           | **405M** |
-| tsl::robin_map          | 150M     |
-| ankerl::unordered_dense | 292M     |
+| MTHT `iter()`           | **396M** |
+| tsl::robin_map          | 133M     |
+| ankerl::unordered_dense | 281M     |
 
 
 
