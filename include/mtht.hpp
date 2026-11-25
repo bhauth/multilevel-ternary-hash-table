@@ -456,14 +456,6 @@ public:
         return block < block_items_.size() ? block_items_[block] : items_;
     }
 
-    // Records in a block. block_items_ holds each closed block's cumulative
-    // item count, so a block's own size is the step from the previous one.
-    std::size_t block_size(std::size_t block) const {
-        const std::size_t end = block < block_items_.size() ? block_items_[block] : items_;
-        const std::size_t begin = block == 0 ? 0 : block_items_[block - 1];
-        return end - begin;
-    }
-
     std::size_t items() const { return items_; }
     std::size_t block_count() const { return blocks_.size(); }
 
@@ -1044,7 +1036,9 @@ private:
     void map_walk(F&& f) const {
         std::size_t block = 0;
         const unsigned char* rec = key_store_.first_record();
-        std::size_t left = key_store_.block_size(0);
+        std::size_t items_done = 0;
+        std::size_t block_end = key_store_.block_end(0);
+        std::size_t left = block_end;
 
     walk:
         while (left != 0) {
@@ -1061,9 +1055,11 @@ private:
             }
         }
 
-        if (++block == key_store_.block_count()) return;
+        if (++block >= key_store_.block_count()) return;
         rec = key_store_.block_start(block);
-        left = key_store_.block_size(block);
+        items_done = block_end;
+        block_end = key_store_.block_end(block);
+        left = block_end - items_done;
         goto walk;
     }
 
