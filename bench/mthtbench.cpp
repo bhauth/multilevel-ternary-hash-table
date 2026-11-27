@@ -534,13 +534,14 @@ static PeerResult time_mtht(const Keys& keys, std::size_t N1, std::size_t N2, ui
         if (d < best) best = d;
     }
     (void)sink;
-    // Slot arrays only: 16 B per Entry (64-bit key + 48-bit value pointer + state
-    // bits, packed) across the table's *live* T1+T2, filled or not (n1()/n2()
-    // report the sizes after any grow). The pointed-to value is the caller's and
-    // is not owned by the table, so no value bytes are counted here -- same as the
-    // peers, whose payload is a pointer too.
+    // Slot arrays plus the record store, on the same basis the peers report:
+    // one figure per key covering the index and the bytes the key and value
+    // occupy. An Entry is 8 B (the packed pointer/fingerprint/state word, see
+    // the static_assert in mtht.hpp); the key and value live in the record
+    // store, which is counted here rather than assumed away. That is what a
+    // peer's node (robin 24 B, umap 32 B, udense pair + index) counts too.
     const double live_n1 = (double)t.n1(), live_n2 = (double)t.n2();
-    const double bytes = (live_n1 + live_n2) * 16.0;
+    const double bytes = (live_n1 + live_n2) * 8.0 + (double)t.key_store_bytes();
     const double load = (double)t.size() / (live_n1 + live_n2);
     return { (double)t.size() / best, (double)t.size() / t_ins, bytes, bytes / (double)t.size(),
              load, t.size() };
@@ -595,7 +596,7 @@ static PeerResult time_umap(const Keys& keys, std::size_t, std::size_t, uint64_t
 // mtht::Hash (splitmix64) instead, the same mixing MTHT pays for, so the two
 // columns differ in table design rather than in hash quality.
 struct robin_mtht_hash {
-    std::size_t operator()(uint64_t k) const { return (std::size_t)mtht::hash_key(k); }
+    std::size_t operator()(uint64_t k) const { return (std::size_t)mtht::hash_word(k); }
 };
 
 // Compiled only where the vendored header exists (see HAVE_ROBIN). The registry

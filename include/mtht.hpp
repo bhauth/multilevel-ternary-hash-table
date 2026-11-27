@@ -23,8 +23,7 @@ struct alignas(8) Entry {
 static_assert(sizeof(Entry) == 8, "Entry must be 8 bytes");
 
 
-// memcmp replacement
-
+// utility for below
 inline uint32_t load32(const char* p) {
     uint32_t v;
     std::memcpy(&v, p, sizeof(v)); // Compiles to a single unaligned mov on -O2
@@ -37,6 +36,7 @@ inline uint64_t load64(const char* p) {
     return v;
 }
 
+// memcmp replacement
 inline bool fast_memeq(const char* a, const char* b, size_t len) {
     if (len >= 8) {
         const size_t end = len - 8;
@@ -63,6 +63,63 @@ inline bool fast_memeq(const char* a, const char* b, size_t len) {
 
     return true;
 }
+
+inline uint64_t hash_word(uint64_t x) {
+    constexpr uint64_t k = 0x9E3779B97F4A7C15ULL;
+    unsigned __int128 product = static_cast<unsigned __int128>(x) * k;
+    uint64_t a = static_cast<uint64_t>(product >> 64);
+    uint64_t b = static_cast<uint64_t>(product);
+    uint64_t h = a ^ b;
+    h ^= (h << 31) | (h >> 33);
+    return h;
+}
+
+uint64_t mix128(uint64_t x, uint64_t y) {
+    unsigned __int128 product = static_cast<unsigned __int128>(x) * y;
+    uint64_t a = static_cast<uint64_t>(product >> 64);
+    uint64_t b = static_cast<uint64_t>(product);
+    return a ^ b;
+}
+
+// handles len != 8 only
+//
+// Like fast_memeq: overlapping 8-byte words, the last one anchored at
+// len-8, so a key costs ceil((len-7)/8) loads and never reads past its end.
+inline uint64_t hash_bytes(const void* p, std::size_t len) {
+    const char* a = static_cast<const char*>(p);
+    if (len < 8) {
+        // fast_memeq's tiers: overlapping in-bounds loads, never past the key.
+        uint64_t w = len << 56;
+        if (len >= 4) {
+            const std::size_t tail = len - 4;
+            w ^= load32(a) ^ (static_cast<uint64_t>(load32(a + tail)) << 32);
+        } else if (len >= 1) {
+            w |= static_cast<unsigned char>(a[0])
+              | (static_cast<uint64_t>(static_cast<unsigned char>(a[len >> 1])) << 8)
+              | (static_cast<uint64_t>(static_cast<unsigned char>(a[len - 1])) << 16);
+        } else {
+            w = 0;
+        }
+        return hash_word(w);
+    }
+    constexpr uint64_t M = 0xC2B2AE3D27D4EB4FULL;
+    std::size_t end = len;
+    uint64_t h1 = M;
+    uint64_t h2 = end;
+    std::size_t i = 0;
+    do {
+        end -= 8;
+        h2 = (h2 >> 33) | (h2 << 31);  // 1-op rotate
+        h1 ^= load64(a + i);
+        h2 ^= load64(a + end);
+        h1 *= M;
+        h2 *= M;
+        h1 ^= h1 >> 29;
+        i += 8;
+    } while (i < end);
+    return mix128(h1, h2 ^ h1);
+}
+
 
 // A slot's word packs two kinds of thing. Bits [56..0] describe the item in
 // the slot -- where its record is, its fingerprint, and whether the slot is
@@ -148,16 +205,7 @@ inline void check_pointer_range(const void* p) {
     }
 }
 
-// splitmix64 finalizer. Avalanches all 64 input bits, so keys 0 and ~0ULL are
-// ordinary keys rather than degenerate ones.
-inline uint64_t hash_key(uint64_t k) {
-    k ^= k >> 30;
-    k *= 0xbf58476d1ce4e5b9ULL;
-    k ^= k >> 27;
-    k *= 0x94d049bb133111ebULL;
-    k ^= k >> 31;
-    return k;
-}
+
 
 inline uint64_t read_word(const void* p) {
     uint64_t w;
@@ -276,44 +324,6 @@ inline uint8_t fingerprint_of_hash(uint64_t h) {
     return static_cast<uint8_t>(h >> 54);
 }
 
-// handles len != 8 only
-//
-// The walk is fast_memeq's: overlapping 8-byte words, the last one anchored at
-// len-8, so a key costs ceil((len-7)/8) loads and never reads past its end.
-inline uint64_t hash_bytes(const void* p, std::size_t len) {
-    const char* a = static_cast<const char*>(p);
-    if (len < 8) {
-        // fast_memeq's tiers: overlapping in-bounds loads, never past the key.
-        uint64_t w = len << 56;
-        if (len >= 4) {
-            const std::size_t tail = len - 4;
-            w ^= load32(a) ^ (static_cast<uint64_t>(load32(a + tail)) << 32);
-        } else if (len >= 1) {
-            w |= static_cast<unsigned char>(a[0])
-              | (static_cast<uint64_t>(static_cast<unsigned char>(a[len >> 1])) << 8)
-              | (static_cast<uint64_t>(static_cast<unsigned char>(a[len - 1])) << 16);
-        } else {
-            w = 0;
-        }
-        return hash_key(w);
-    }
-    constexpr uint64_t M = 0xC2B2AE3D27D4EB4FULL;
-    std::size_t end = len;
-    uint64_t h1 = len;
-    uint64_t h2 = end;
-    std::size_t i = 0;
-    do {
-        end -= 8;
-        h2 = (h2 >> 33) | (h2 << 31);  // 1-op rotate
-        h1 ^= load64(a + i);
-        h2 ^= load64(a + end);
-        h1 *= M;
-        h2 *= M;
-        h1 ^= h1 >> 29;
-        i += 8;
-    } while (i < end);
-    return (h1 ^ h2) * M;
-}
 
 inline uint8_t get_fingerprint(const Entry& e) {
     return static_cast<uint8_t>((e.word >> FP_SHIFT) & FP_MASK);
@@ -387,7 +397,7 @@ struct Hash {
     uint64_t operator()(const void* p, std::size_t len) const {
         return hash_bytes(p, len);
     }
-    uint64_t operator()(uint64_t key) const { return hash_key(key); }
+    uint64_t operator()(uint64_t key) const { return hash_word(key); }
 };
 
 class KeyStore {
@@ -872,7 +882,7 @@ public:
     }
 
     void* find_key_8_val(uint64_t key_val) const {
-        const uint64_t hh = hash_key(key_val);
+        const uint64_t hh = hash_word(key_val);
         const uint8_t fp = fingerprint_of_hash(hh);
         const Entry& home = t1_[hh & mask1_];
         const uint8_t s_home = get_state(home);
